@@ -8,6 +8,18 @@ READ THE LICENCE OF THIS BEFORE YOU TRY ANY SHIT. IF YOU MAKE THIS INTO A HEDGE 
 
 If you want to contribute to this, fork it or pull it and make a pr back to the repo. Failure to do this will also result in a lawsuit.
 
+This software is licenced under the GNU Affero General Public License v3.0 (AGPL-3.0). This is why it's good for the summary (llm wrote the following)
+
+1. Strongest copyleft protection: It requires that all modified versions of your code remain open source, even when running as a network service.
+
+2. Closes the "service loophole": Unlike regular GPL, AGPL specifically addresses network/cloud services. If someone uses your trading bot code to run a service (like a hedge fund's trading infrastructure), they must release their modifications.
+
+3. Prevents commercial exploitation without sharing: Anyone who modifies and uses your code commercially must share their improvements back to the community.
+
+4. Allows for commercial use with constraints: People can still use it commercially, but they cannot keep their modifications private.
+
+5. Preserves attribution: Ensures you're credited as the original creator.
+
 ## Method
 
 I did vibe code this, but my conception of vibe coding is not windsurf or cursor, I have had terrible TERRIBLE experience coding with those. I use claude-3.7 to generate the project structure API connections and then edit that code.
@@ -55,7 +67,7 @@ python main.py --stats
 - `strategies/`: Trading strategies
 - `execution/`: Order execution and position management
 - `utils/`: Utility functions
-- `logs/`: bot logs 
+- `logs/`: bot logs
 
 ## Adding New Strategies
 
