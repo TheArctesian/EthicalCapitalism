@@ -1,0 +1,3522 @@
+--- File: ./requirements.txt ---
+ib_insync==0.9.65
+pandas==1.5.3
+numpy==1.24.2
+pytz==2023.3
+matplotlib==3.7.1
+
+--- File: ./data/market_data.py ---
+"""Real-time market data functionality."""
+import logging
+from ib_insync import util
+
+logger = logging.getLogger('data.market_data')
+
+class MarketDataProvider:
+    """Provider for real-time market data."""
+    
+    def __init__(self, ib_connection):
+        """Initialize with an IB connection."""
+        self.ib_connection = ib_connection
+        self.active_subscriptions = {}  # Symbol -> ticker
+    
+    def get_market_price(self, contract, timeout=5):
+        """Get the current market price for a contract.
+        
+        Args:
+            contract: IB contract object
+            timeout: Time to wait for data in seconds
+            
+        Returns:
+            float: Current market price or None if unavailable
+        """
+        ib = self.ib_connection.ensure_connection()
+        
+        try:
+            if contract.symbol in self.active_subscriptions:
+                # We're already subscribed to this ticker
+                ticker = self.active_subscriptions[contract.symbol]
+            else:
+                # Create a new subscription
+                ticker = ib.reqMktData(contract)
+                self.active_subscriptions[contract.symbol] = ticker
+            
+            # Wait for data to arrive
+            for _ in range(timeout):
+                ib.waitOnUpdate(timeout=1)
+                last_price = ticker.marketPrice()
+                if last_price > 0:
+                    return last_price
+            
+            logger.warning(f"Couldn't get market price for {contract.symbol} within timeout")
+            return None
+            
+        except Exception as e:
+            logger.error(f"Error getting market price for {contract.symbol}: {e}")
+            return None
+    
+    def get_bid_ask(self, contract, timeout=5):
+        """Get the current bid and ask prices for a contract."""
+        ib = self.ib_connection.ensure_connection()
+        
+        try:
+            if contract.symbol in self.active_subscriptions:
+                ticker = self.active_subscriptions[contract.symbol]
+            else:
+                ticker = ib.reqMktData(contract)
+                self.active_subscriptions[contract.symbol] = ticker
+            
+            # Wait for data to arrive
+            for _ in range(timeout):
+                ib.waitOnUpdate(timeout=1)
+                bid = ticker.bid
+                ask = ticker.ask
+                if bid > 0 and ask > 0:
+                    return {'bid': bid, 'ask': ask}
+            
+            logger.warning(f"Couldn't get bid/ask for {contract.symbol} within timeout")
+            return None
+            
+        except Exception as e:
+            logger.error(f"Error getting bid/ask for {contract.symbol}: {e}")
+            return None
+    
+    def unsubscribe(self, contract):
+        """Unsubscribe from market data for a contract."""
+        ib = self.ib_connection.ensure_connection()
+        
+        if contract.symbol in self.active_subscriptions:
+            ib.cancelMktData(contract)
+            del self.active_subscriptions[contract.symbol]
+            logger.info(f"Unsubscribed from market data for {contract.symbol}")
+    
+    def unsubscribe_all(self):
+        """Unsubscribe from all market data."""
+        ib = self.ib_connection.ensure_connection()
+        
+        for symbol, ticker in list(self.active_subscriptions.items()):
+            ib.cancelMktData(ticker.contract)
+            logger.info(f"Unsubscribed from market data for {symbol}")
+        
+        self.active_subscriptions = {}
+
+--- File: ./data/__init__.py ---
+
+
+--- File: ./data/historical.py ---
+"""Functions for retrieving historical market data."""
+import logging
+import pandas as pd
+from ib_insync import util
+
+logger = logging.getLogger('data.historical')
+
+class HistoricalDataProvider:
+    """Provider for historical market data."""
+    
+    def __init__(self, ib_connection):
+        """Initialize with an IB connection."""
+        self.ib_connection = ib_connection
+    
+    def get_historical_data(self, contract, duration='20 D', bar_size='1 day',
+                           what_to_show='MIDPOINT', use_rth=True):
+        """Get historical data for a contract."""
+        ib = self.ib_connection.ensure_connection()
+        
+        try:
+            bars = ib.reqHistoricalData(
+                contract,
+                endDateTime='',
+                durationStr=duration,
+                barSizeSetting=bar_size,
+                whatToShow=what_to_show,
+                useRTH=use_rth
+            )
+            
+            if not bars:
+                logger.warning(f"No historical data returned for {contract.symbol}")
+                return None
+                
+            df = util.df(bars)
+            return df
+            
+        except Exception as e:
+            logger.error(f"Error getting historical data for {contract.symbol}: {e}")
+            return None
+    
+    def calculate_indicators(self, df, sma_short=5, sma_long=20):
+        """Calculate technical indicators on a dataframe."""
+        if df is None or len(df) < sma_long:
+            return None
+            
+        # Make a copy to avoid modifying the original
+        result = df.copy()
+        
+        # Calculate simple moving averages
+        result[f'SMA{sma_short}'] = result['close'].rolling(sma_short).mean()
+        result[f'SMA{sma_long}'] = result['close'].rolling(sma_long).mean()
+        
+        # Calculate volatility (20-day rolling standard deviation of returns)
+        result['returns'] = result['close'].pct_change()
+        result['volatility'] = result['returns'].rolling(20).std() * (252 ** 0.5)  # Annualized
+        
+        return result
+
+--- File: ./strategies/volatility.py ---
+"""Volatility-based strategy implementation."""
+import logging
+import numpy as np
+from strategies.base_strategy import BaseStrategy
+from config.settings import LOOKBACK_PERIOD
+
+logger = logging.getLogger('strategies.volatility')
+
+class VolatilityBreakout(BaseStrategy):
+    """Volatility breakout strategy.
+    
+    This strategy looks for breakouts from price ranges defined by volatility
+    measures. It buys when price breaks above recent volatility bands and sells
+    when it breaks below.
+    """
+    
+    def __init__(self, data_provider, volatility_factor=2.0, lookback=LOOKBACK_PERIOD):
+        """Initialize the volatility breakout strategy.
+        
+        Args:
+            data_provider: Data provider object
+            volatility_factor: Multiplier for volatility bands (e.g., 2.0 = 2 standard deviations)
+            lookback: Lookback period for calculating bands
+        """
+        super().__init__(data_provider)
+        self.volatility_factor = volatility_factor
+        self.lookback = lookback
+    
+    def generate_signals(self, contracts):
+        """Generate trading signals based on volatility breakouts.
+        
+        Args:
+            contracts: List of contract objects to analyze
+            
+        Returns:
+            dict: Dictionary of signals by symbol
+        """
+        signals = {}
+        
+        for contract in contracts:
+            # Get historical data
+            df = self.data_provider.get_historical_data(
+                contract,
+                duration=f'{self.lookback+10} D'  # Get a bit more data than needed
+            )
+            
+            if df is None or len(df) < self.lookback + 2:
+                logger.warning(f"Insufficient data for {contract.symbol}")
+                continue
+                
+            # Calculate indicators
+            df['returns'] = df['close'].pct_change()
+            df['volatility'] = df['returns'].rolling(self.lookback).std() * np.sqrt(252)  # Annualized
+            
+            # Calculate the center of the band (moving average)
+            df['sma'] = df['close'].rolling(self.lookback).mean()
+            
+            # Calculate volatility bands
+            band_width = df['close'] * df['volatility'] * self.volatility_factor / np.sqrt(252)
+            df['upper_band'] = df['sma'] + band_width
+            df['lower_band'] = df['sma'] - band_width
+            
+            # Get the last two rows
+            if len(df) < 2:
+                continue
+                
+            last_row = df.iloc[-1]
+            prev_row = df.iloc[-2]
+            
+            # Determine signal
+            signal = None
+            
+            # Buy signal: price crosses above upper band
+            if prev_row['close'] <= prev_row['upper_band'] and last_row['close'] > last_row['upper_band']:
+                signal = 'BUY'
+                
+            # Sell signal: price crosses below lower band
+            elif prev_row['close'] >= prev_row['lower_band'] and last_row['close'] < last_row['lower_band']:
+                signal = 'SELL'
+            
+            if signal:
+                logger.info(f"Generated {signal} signal for {contract.symbol}")
+                signals[contract.symbol] = {
+                    'action': signal,
+                    'price': last_row['close'],
+                    'volatility': last_row['volatility']
+                }
+                
+        return signals
+
+--- File: ./strategies/moving_average.py ---
+"""Enhanced moving average strategy with confirmation filters."""
+import logging
+import numpy as np
+from strategies.base_strategy import BaseStrategy
+from config.settings import SMA_SHORT, SMA_LONG, LOOKBACK_PERIOD
+
+logger = logging.getLogger('strategies.enhanced_ma')
+
+class EnhancedMovingAverage(BaseStrategy):
+    """Enhanced moving average strategy with multiple confirmations."""
+    
+    def __init__(self, data_provider, short_period=SMA_SHORT, long_period=SMA_LONG,
+                 volume_factor=1.5, signal_strength_threshold=0.01, rsi_period=14):
+        """Initialize the enhanced MA strategy."""
+        super().__init__(data_provider)
+        self.short_period = short_period
+        self.long_period = long_period
+        self.volume_factor = volume_factor  # Volume should be this times average to confirm
+        self.signal_strength_threshold = signal_strength_threshold  # Min % difference for crossover
+        self.rsi_period = rsi_period
+    
+    def calculate_rsi(self, prices, period=14):
+        """Calculate RSI technical indicator."""
+        deltas = np.diff(prices)
+        seed = deltas[:period+1]
+        up = seed[seed >= 0].sum()/period
+        down = -seed[seed < 0].sum()/period
+        rs = up/down if down != 0 else np.inf
+        rsi = np.zeros_like(prices)
+        rsi[:period] = 100. - 100./(1. + rs)
+        
+        for i in range(period, len(prices)):
+            delta = deltas[i-1]
+            if delta > 0:
+                upval = delta
+                downval = 0
+            else:
+                upval = 0
+                downval = -delta
+                
+            up = (up * (period-1) + upval) / period
+            down = (down * (period-1) + downval) / period
+            rs = up/down if down != 0 else np.inf
+            rsi[i] = 100. - 100./(1. + rs)
+        return rsi
+    
+    def detect_market_regime(self, df, lookback=50):
+        """Detect if market is trending or range-bound."""
+        if len(df) < lookback:
+            return "unknown"
+            
+        # Calculate directional movement
+        price_direction = df['close'].iloc[-1] - df['close'].iloc[-lookback]
+        price_range = df['high'].iloc[-lookback:].max() - df['low'].iloc[-lookback:].min()
+        
+        # Calculate ADX-like measure
+        directional_strength = abs(price_direction) / price_range if price_range > 0 else 0
+        
+        if directional_strength > 0.3:  # Threshold can be tuned
+            return "trending"
+        else:
+            return "range_bound"
+    
+    def generate_signals(self, contracts):
+        """Generate trading signals with confirmation filters."""
+        signals = {}
+        
+        for contract in contracts:
+            # Get historical data with more data points to calculate indicators
+            df = self.data_provider.get_historical_data(
+                contract,
+                duration=f'{max(LOOKBACK_PERIOD, 50) + 20} D'
+            )
+            
+            if df is None or len(df) < self.long_period + 2:
+                logger.warning(f"Insufficient data for {contract.symbol}")
+                continue
+                
+            # Calculate indicators
+            df['sma_short'] = df['close'].rolling(self.short_period).mean()
+            df['sma_long'] = df['close'].rolling(self.long_period).mean()
+            df['ma_diff'] = (df['sma_short'] - df['sma_long']) / df['close'] * 100  # % difference
+            df['volume_avg'] = df['volume'].rolling(20).mean()
+            df['volume_ratio'] = df['volume'] / df['volume_avg']
+            
+            # Calculate RSI
+            df['rsi'] = self.calculate_rsi(df['close'].values, self.rsi_period)
+            
+            # Detect market regime
+            market_regime = self.detect_market_regime(df)
+            
+            # Get last two rows to check for crossover
+            last_row = df.iloc[-1]
+            prev_row = df.iloc[-2]
+            
+            # Determine base signal
+            signal = None
+            
+            # Buy signal: short MA crosses above long MA
+            if (prev_row['sma_short'] <= prev_row['sma_long'] and 
+                last_row['sma_short'] > last_row['sma_long']):
+                
+                # Apply confirmation filters
+                if (abs(last_row['ma_diff']) >= self.signal_strength_threshold and
+                    last_row['volume_ratio'] >= self.volume_factor):
+                    
+                    # Additional RSI filter
+                    if market_regime == "trending" or (
+                        market_regime == "range_bound" and last_row['rsi'] < 70):
+                        signal = 'BUY'
+                        
+            # Sell signal: short MA crosses below long MA
+            elif (prev_row['sma_short'] >= prev_row['sma_long'] and 
+                  last_row['sma_short'] < last_row['sma_long']):
+                
+                # Apply confirmation filters
+                if (abs(last_row['ma_diff']) >= self.signal_strength_threshold and
+                    last_row['volume_ratio'] >= self.volume_factor):
+                    
+                    # Additional RSI filter
+                    if market_regime == "trending" or (
+                        market_regime == "range_bound" and last_row['rsi'] > 30):
+                        signal = 'SELL'
+            
+            if signal:
+                logger.info(f"Generated {signal} signal for {contract.symbol} (Regime: {market_regime})")
+                signals[contract.symbol] = {
+                    'action': signal,
+                    'price': last_row['close'],
+                    'volatility': last_row.get('volatility', df['close'].pct_change().std() * np.sqrt(252)),
+                    'signal_strength': abs(last_row['ma_diff']),
+                    'market_regime': market_regime
+                }
+                
+        return signals
+
+--- File: ./strategies/base_strategy.py ---
+"""Base strategy class for the trading bot."""
+import logging
+
+logger = logging.getLogger('strategies.base')
+
+class BaseStrategy:
+    """Base class for all trading strategies."""
+    
+    def __init__(self, data_provider):
+        """Initialize the strategy with a data provider."""
+        self.data_provider = data_provider
+        
+    def generate_signals(self, contracts):
+        """Generate trading signals for the given contracts.
+        
+        This method should be implemented by subclasses.
+        
+        Args:
+            contracts: List of IB contract objects to analyze
+            
+        Returns:
+            dict: A dictionary of signals by symbol
+        """
+        raise NotImplementedError("Subclasses must implement generate_signals")
+
+--- File: ./strategies/__init__.py ---
+
+
+--- File: ./strategies/mean_reversion.py ---
+"""Mean reversion strategy for range-bound markets."""
+import logging
+import numpy as np
+from strategies.base_strategy import BaseStrategy
+
+logger = logging.getLogger('strategies.mean_reversion')
+
+class MeanReversionStrategy(BaseStrategy):
+    """Mean reversion strategy for range-bound ETFs."""
+    
+    def __init__(self, data_provider, rsi_period=14, rsi_oversold=30, rsi_overbought=70,
+                 bollinger_period=20, bollinger_std=2.0, min_mean_reversion_score=0.7):
+        """Initialize the mean reversion strategy."""
+        super().__init__(data_provider)
+        self.rsi_period = rsi_period
+        self.rsi_oversold = rsi_oversold
+        self.rsi_overbought = rsi_overbought
+        self.bollinger_period = bollinger_period
+        self.bollinger_std = bollinger_std
+        self.min_mean_reversion_score = min_mean_reversion_score
+    
+    def calculate_rsi(self, prices, period=14):
+        """Calculate RSI technical indicator."""
+        deltas = np.diff(prices)
+        seed = deltas[:period+1]
+        up = seed[seed >= 0].sum()/period
+        down = -seed[seed < 0].sum()/period
+        rs = up/down if down != 0 else np.inf
+        rsi = np.zeros_like(prices)
+        rsi[:period] = 100. - 100./(1. + rs)
+        
+        for i in range(period, len(prices)):
+            delta = deltas[i-1]
+            if delta > 0:
+                upval = delta
+                downval = 0
+            else:
+                upval = 0
+                downval = -delta
+                
+            up = (up * (period-1) + upval) / period
+            down = (down * (period-1) + downval) / period
+            rs = up/down if down != 0 else np.inf
+            rsi[i] = 100. - 100./(1. + rs)
+        return rsi
+    
+    def calculate_mean_reversion_score(self, df, lookback=100):
+        """Calculate a score indicating how mean-reverting an asset is."""
+        if len(df) < lookback:
+            return 0.5  # Not enough data
+            
+        # Calculate returns
+        returns = df['close'].pct_change().dropna()
+        
+        # Calculate autocorrelation of returns
+        # Negative autocorrelation suggests mean reversion
+        autocorr = returns[-lookback:].autocorr(1)
+        
+        # Normalize to a 0-1 score where higher means more mean-reverting
+        score = 0.5 - min(max(autocorr, -1), 1) / 2
+        
+        return score
+    
+    def generate_signals(self, contracts):
+        """Generate mean reversion trading signals."""
+        signals = {}
+        
+        for contract in contracts:
+            # Get historical data
+            df = self.data_provider.get_historical_data(
+                contract,
+                duration='100 D'
+            )
+            
+            if df is None or len(df) < self.bollinger_period + 2:
+                logger.warning(f"Insufficient data for {contract.symbol}")
+                continue
+                
+            # Calculate mean reversion score
+            mr_score = self.calculate_mean_reversion_score(df)
+            
+            # If asset doesn't exhibit mean reversion, skip it
+            if mr_score < self.min_mean_reversion_score:
+                logger.info(f"Skipping {contract.symbol} - low mean reversion score: {mr_score:.2f}")
+                continue
+                
+            # Calculate indicators
+            df['sma'] = df['close'].rolling(self.bollinger_period).mean()
+            df['std'] = df['close'].rolling(self.bollinger_period).std()
+            df['upper_band'] = df['sma'] + (df['std'] * self.bollinger_std)
+            df['lower_band'] = df['sma'] - (df['std'] * self.bollinger_std)
+            df['pct_b'] = (df['close'] - df['lower_band']) / (df['upper_band'] - df['lower_band'])
+            
+            # Calculate RSI
+            df['rsi'] = self.calculate_rsi(df['close'].values, self.rsi_period)
+            
+            # Get the last row
+            last_row = df.iloc[-1]
+            
+            # Determine signal
+            signal = None
+            
+            # Buy signal: Price near lower band and RSI oversold
+            if (last_row['pct_b'] < 0.2 and last_row['rsi'] < self.rsi_oversold):
+                signal = 'BUY'
+                
+            # Sell signal: Price near upper band and RSI overbought
+            elif (last_row['pct_b'] > 0.8 and last_row['rsi'] > self.rsi_overbought):
+                signal = 'SELL'
+            
+            if signal:
+                logger.info(f"Generated {signal} signal for {contract.symbol} (MR Score: {mr_score:.2f})")
+                signals[contract.symbol] = {
+                    'action': signal,
+                    'price': last_row['close'],
+                    'volatility': df['close'].pct_change().std() * np.sqrt(252),
+                    'mean_reversion_score': mr_score
+                }
+                
+        return signals
+
+--- File: ./strategies/ensamble.py ---
+"""Ensemble strategy that combines multiple strategies."""
+import logging
+from strategies.base_strategy import BaseStrategy
+
+logger = logging.getLogger('strategies.ensemble')
+
+class EnsembleStrategy(BaseStrategy):
+    """Combines signals from multiple strategies with weighted voting."""
+    
+    def __init__(self, data_provider, strategies, weights=None):
+        """Initialize the ensemble strategy.
+        
+        Args:
+            data_provider: Data provider object
+            strategies: List of strategy objects
+            weights: Optional list of weights for each strategy (default: equal)
+        """
+        super().__init__(data_provider)
+        self.strategies = strategies
+        
+        # Set equal weights if not provided
+        if weights is None:
+            self.weights = [1.0 / len(strategies)] * len(strategies)
+        else:
+            # Normalize weights to sum to 1
+            total = sum(weights)
+            self.weights = [w / total for w in weights]
+    
+    def generate_signals(self, contracts):
+        """Generate signals by combining results from all strategies."""
+        all_signals = {}
+        
+        # Collect signals from each strategy
+        for i, strategy in enumerate(self.strategies):
+            strategy_signals = strategy.generate_signals(contracts)
+            weight = self.weights[i]
+            
+            # Store signals with strategy weight
+            for symbol, signal_data in strategy_signals.items():
+                if symbol not in all_signals:
+                    all_signals[symbol] = {
+                        'buy_score': 0.0,
+                        'sell_score': 0.0,
+                        'price': signal_data['price'],
+                        'volatility': signal_data.get('volatility', 0.2),
+                        'strategies': []
+                    }
+                
+                # Add this strategy's vote
+                if signal_data['action'] == 'BUY':
+                    all_signals[symbol]['buy_score'] += weight
+                elif signal_data['action'] == 'SELL':
+                    all_signals[symbol]['sell_score'] += weight
+                
+                # Track which strategies generated signals
+                all_signals[symbol]['strategies'].append({
+                    'name': strategy.__class__.__name__,
+                    'action': signal_data['action'],
+                    'weight': weight
+                })
+        
+        # Determine final signals based on consensus
+        signals = {}
+        for symbol, data in all_signals.items():
+            action = None
+            threshold = 0.6  # Require 60% consensus for a signal
+            
+            if data['buy_score'] > threshold and data['buy_score'] > data['sell_score']:
+                action = 'BUY'
+            elif data['sell_score'] > threshold and data['sell_score'] > data['buy_score']:
+                action = 'SELL'
+            
+            if action:
+                signals[symbol] = {
+                    'action': action,
+                    'price': data['price'],
+                    'volatility': data['volatility'],
+                    'confidence': data['buy_score'] if action == 'BUY' else data['sell_score'],
+                    'contributing_strategies': ', '.join([s['name'] for s in data['strategies'] 
+                                                        if s['action'] == action])
+                }
+                
+                logger.info(f"Ensemble generated {action} signal for {symbol} with " 
+                           f"confidence {signals[symbol]['confidence']:.2f}")
+                
+        return signals
+
+--- File: ./core/connection.py ---
+"""IBKR connection management."""
+import logging
+from ib_insync import IB
+from config.settings import IB_HOST, IB_PORT, CLIENT_ID
+
+logger = logging.getLogger('core.connection')
+
+class IBConnection:
+    """Manages the connection to Interactive Brokers."""
+    
+    def __init__(self):
+        """Initialize the IB connection."""
+        self.ib = IB()
+        self.connected = False
+    
+    def connect(self):
+        """Connect to IB TWS/Gateway."""
+        if self.connected:
+            logger.info("Already connected to IBKR")
+            return self.ib
+        
+        try:
+            self.ib.connect(IB_HOST, IB_PORT, clientId=CLIENT_ID)
+            self.connected = True
+            logger.info("Successfully connected to IBKR")
+            return self.ib
+        except Exception as e:
+            logger.error(f"Failed to connect to IBKR: {e}")
+            raise
+    
+    def disconnect(self):
+        """Disconnect from IB."""
+        if self.connected:
+            self.ib.disconnect()
+            self.connected = False
+            logger.info("Disconnected from IBKR")
+    
+    def ensure_connection(self):
+        """Ensure that we have an active connection to IB."""
+        if not self.connected or not self.ib.isConnected():
+            return self.connect()
+        return self.ib
+
+--- File: ./core/portfolio.py ---
+"""Portfolio management functionality."""
+import logging
+import pandas as pd
+from datetime import datetime
+
+logger = logging.getLogger('core.portfolio')
+
+class Portfolio:
+    """Manages the trading portfolio."""
+    
+    def __init__(self, ib_connection):
+        """Initialize with an IB connection."""
+        self.ib_connection = ib_connection
+        self.positions = {}  # Current positions
+        self.transactions = []  # Transaction history
+        self.starting_cash = 0  # Starting cash amount
+        self.current_cash = 0  # Current cash amount
+    
+    def initialize(self):
+        """Initialize portfolio with account data."""
+        ib = self.ib_connection.ensure_connection()
+        
+        try:
+            # Get account summary
+            account_summary = ib.accountSummary()
+            
+            # Find cash balance
+            for summary in account_summary:
+                if summary.tag == 'TotalCashValue':
+                    self.starting_cash = float(summary.value)
+                    self.current_cash = float(summary.value)
+                    break
+            
+            logger.info(f"Portfolio initialized with {self.current_cash} cash")
+            
+            # Get current positions
+            self.update_positions()
+            
+        except Exception as e:
+            logger.error(f"Error initializing portfolio: {e}")
+    
+    def update_positions(self):
+        """Update current positions from IB."""
+        ib = self.ib_connection.ensure_connection()
+        
+        try:
+            # Get current positions
+            portfolio_items = ib.portfolio()
+            
+            # Reset positions
+            self.positions = {}
+            
+            # Update with current positions
+            for item in portfolio_items:
+                symbol = item.contract.symbol
+                if item.position != 0:
+                    self.positions[symbol] = {
+                        'contract': item.contract,
+                        'quantity': item.position,
+                        'avg_cost': item.avgCost,
+                        'market_price': item.marketPrice,
+                        'market_value': item.marketValue,
+                        'unrealized_pnl': item.unrealizedPNL,
+                        'realized_pnl': item.realizedPNL
+                    }
+            
+            # Update cash balance
+            self.update_cash()
+            
+            logger.info(f"Portfolio updated: {len(self.positions)} positions, {self.current_cash} cash")
+            return self.positions
+            
+        except Exception as e:
+            logger.error(f"Error updating positions: {e}")
+            return {}
+    
+    def update_cash(self):
+        """Update current cash balance."""
+        ib = self.ib_connection.ensure_connection()
+        
+        try:
+            # Get account summary
+            account_summary = ib.accountSummary()
+            
+            # Find cash balance
+            for summary in account_summary:
+                if summary.tag == 'TotalCashValue':
+                    self.current_cash = float(summary.value)
+                    break
+                    
+        except Exception as e:
+            logger.error(f"Error updating cash balance: {e}")
+    
+    def record_transaction(self, contract, action, quantity, price, commission=0):
+        """Record a transaction in the transaction history."""
+        transaction = {
+            'date': datetime.now(),
+            'symbol': contract.symbol,
+            'action': action,
+            'quantity': quantity,
+            'price': price,
+            'value': quantity * price,
+            'commission': commission
+        }
+        
+        self.transactions.append(transaction)
+        logger.info(f"Recorded transaction: {action} {quantity} {contract.symbol} @ {price}")
+    
+    def get_position_value(self):
+        """Get the current value of all positions."""
+        return sum(pos['market_value'] for pos in self.positions.values())
+    
+    def get_total_value(self):
+        """Get the total portfolio value (positions + cash)."""
+        return self.get_position_value() + self.current_cash
+    
+    def get_performance(self):
+        """Calculate portfolio performance metrics."""
+        total_value = self.get_total_value()
+        starting_value = self.starting_cash
+        
+        if starting_value == 0:
+            return {
+                'total_return_pct': 0,
+                'total_return_value': 0
+            }
+            
+        total_return_pct = (total_value - starting_value) / starting_value * 100
+        total_return_value = total_value - starting_value
+        
+        return {
+            'total_return_pct': total_return_pct,
+            'total_return_value': total_return_value,
+            'current_value': total_value,
+            'starting_value': starting_value
+        }
+    
+    def export_transactions(self, filename='transactions.csv'):
+        """Export transactions to a CSV file."""
+        if not self.transactions:
+            logger.warning("No transactions to export")
+            return False
+            
+        try:
+            df = pd.DataFrame(self.transactions)
+            df.to_csv(filename, index=False)
+            logger.info(f"Exported {len(self.transactions)} transactions to {filename}")
+            return True
+        except Exception as e:
+            logger.error(f"Error exporting transactions: {e}")
+            return False
+
+--- File: ./core/__init__.py ---
+
+
+--- File: ./core/bot.py ---
+"""Main bot class that orchestrates the trading process."""
+import logging
+import time
+from config.settings import EXECUTION_INTERVAL
+from config.symbols import ETF_LIST
+
+logger = logging.getLogger('core.bot')
+
+class EcoETFBot:
+    """Main trading bot class."""
+    
+    def __init__(self, connection, data_provider, market_data, strategy, 
+                position_manager, order_executor, portfolio, risk_manager):
+        """Initialize the bot with its components."""
+        self.connection = connection
+        self.data_provider = data_provider
+        self.market_data = market_data
+        self.strategy = strategy
+        self.position_manager = position_manager
+        self.order_executor = order_executor
+        self.portfolio = portfolio
+        self.risk_manager = risk_manager
+        self.etfs = ETF_LIST
+        self.running = False
+    
+    def execute_cycle(self):
+        """Execute one full trading cycle."""
+        logger.info("Starting trading cycle")
+        
+        try:
+            # Update portfolio and positions
+            self.portfolio.update_positions()
+            self.position_manager.update_positions()
+            
+            # Manage existing positions (check stop losses, etc.)
+            self.position_manager.manage_open_positions()
+            
+            # Generate new signals
+            signals = self.strategy.generate_signals(self.etfs)
+            
+            # Execute signals if risk allows
+            for symbol, signal_data in signals.items():
+                # Find the contract for this symbol
+                contract = next((etf for etf in self.etfs if etf.symbol == symbol), None)
+                if not contract:
+                    continue
+                
+                action = signal_data['action']
+                price = signal_data['price']
+                volatility = signal_data.get('volatility', 0.2)
+                
+                # Check if we can take this position based on risk
+                portfolio_value = self.portfolio.get_total_value()
+                if not self.risk_manager.check_portfolio_risk(self.portfolio):
+                    logger.info(f"Skipping {symbol} {action} due to portfolio risk limits")
+                    continue
+                
+                # Implement the signal
+                if action == 'BUY' and not self.position_manager.has_position(symbol):
+                    # Calculate position size based on risk management
+                    quantity = self.risk_manager.calculate_position_size(
+                        price, volatility, portfolio_value)
+                    
+                    # Place the order
+                    order_result = self.order_executor.place_market_order(
+                        contract, 'BUY', quantity)
+                    
+                    if order_result and 'fill_price' in order_result:
+                        # Record the transaction
+                        self.portfolio.record_transaction(
+                            contract, 'BUY', quantity, order_result['fill_price'])
+                        
+                elif action == 'SELL' and self.position_manager.has_position(symbol):
+                    position = self.position_manager.positions[symbol]
+                    
+                    # Place the order
+                    order_result = self.order_executor.place_market_order(
+                        contract, 'SELL', abs(position['quantity']))
+                    
+                    if order_result and 'fill_price' in order_result:
+                        # Record the transaction
+                        self.portfolio.record_transaction(
+                            contract, 'SELL', abs(position['quantity']), 
+                            order_result['fill_price'])
+            
+            # Output portfolio summary
+            performance = self.portfolio.get_performance()
+            logger.info(f"Portfolio value: ${self.portfolio.get_total_value():.2f} "
+                       f"(Return: {performance['total_return_pct']:.2f}%)")
+            
+            logger.info("Trading cycle completed")
+            
+        except Exception as e:
+            logger.error(f"Error during trading cycle: {e}")
+    
+    def run(self):
+        """Run the trading bot."""
+        logger.info("Starting Trading Bot")
+        self.running = True
+        
+        try:
+            while self.running:
+                self.execute_cycle()
+                logger.info(f"Waiting {EXECUTION_INTERVAL} seconds until next cycle")
+                time.sleep(EXECUTION_INTERVAL)
+                
+        except KeyboardInterrupt:
+            logger.info("Bot stopped by user")
+        except Exception as e:
+            logger.error(f"Unexpected error: {e}")
+        finally:
+            self.stop()
+    
+    def stop(self):
+        """Stop the trading bot."""
+        self.running = False
+        
+        # Clean up resources
+        try:
+            # Unsubscribe from market data
+            self.market_data.unsubscribe_all()
+            
+            # Export transaction history
+            self.portfolio.export_transactions()
+            
+            # Disconnect from IB
+            self.connection.disconnect()
+            
+            logger.info("Bot resources cleaned up")
+        except Exception as e:
+            logger.error(f"Error during cleanup: {e}")
+            
+        logger.info("Bot stopped")
+
+--- File: ./LICENSE ---
+                    GNU AFFERO GENERAL PUBLIC LICENSE
+                       Version 3, 19 November 2007
+
+ Copyright (C) 2007 Free Software Foundation, Inc. <https://fsf.org/>
+ Everyone is permitted to copy and distribute verbatim copies
+ of this license document, but changing it is not allowed.
+
+                            Preamble
+
+  The GNU Affero General Public License is a free, copyleft license for
+software and other kinds of works, specifically designed to ensure
+cooperation with the community in the case of network server software.
+
+  The licenses for most software and other practical works are designed
+to take away your freedom to share and change the works.  By contrast,
+our General Public Licenses are intended to guarantee your freedom to
+share and change all versions of a program--to make sure it remains free
+software for all its users.
+
+  When we speak of free software, we are referring to freedom, not
+price.  Our General Public Licenses are designed to make sure that you
+have the freedom to distribute copies of free software (and charge for
+them if you wish), that you receive source code or can get it if you
+want it, that you can change the software or use pieces of it in new
+free programs, and that you know you can do these things.
+
+  Developers that use our General Public Licenses protect your rights
+with two steps: (1) assert copyright on the software, and (2) offer
+you this License which gives you legal permission to copy, distribute
+and/or modify the software.
+
+  A secondary benefit of defending all users' freedom is that
+improvements made in alternate versions of the program, if they
+receive widespread use, become available for other developers to
+incorporate.  Many developers of free software are heartened and
+encouraged by the resulting cooperation.  However, in the case of
+software used on network servers, this result may fail to come about.
+The GNU General Public License permits making a modified version and
+letting the public access it on a server without ever releasing its
+source code to the public.
+
+  The GNU Affero General Public License is designed specifically to
+ensure that, in such cases, the modified source code becomes available
+to the community.  It requires the operator of a network server to
+provide the source code of the modified version running there to the
+users of that server.  Therefore, public use of a modified version, on
+a publicly accessible server, gives the public access to the source
+code of the modified version.
+
+  An older license, called the Affero General Public License and
+published by Affero, was designed to accomplish similar goals.  This is
+a different license, not a version of the Affero GPL, but Affero has
+released a new version of the Affero GPL which permits relicensing under
+this license.
+
+  The precise terms and conditions for copying, distribution and
+modification follow.
+
+                       TERMS AND CONDITIONS
+
+  0. Definitions.
+
+  "This License" refers to version 3 of the GNU Affero General Public License.
+
+  "Copyright" also means copyright-like laws that apply to other kinds of
+works, such as semiconductor masks.
+
+  "The Program" refers to any copyrightable work licensed under this
+License.  Each licensee is addressed as "you".  "Licensees" and
+"recipients" may be individuals or organizations.
+
+  To "modify" a work means to copy from or adapt all or part of the work
+in a fashion requiring copyright permission, other than the making of an
+exact copy.  The resulting work is called a "modified version" of the
+earlier work or a work "based on" the earlier work.
+
+  A "covered work" means either the unmodified Program or a work based
+on the Program.
+
+  To "propagate" a work means to do anything with it that, without
+permission, would make you directly or secondarily liable for
+infringement under applicable copyright law, except executing it on a
+computer or modifying a private copy.  Propagation includes copying,
+distribution (with or without modification), making available to the
+public, and in some countries other activities as well.
+
+  To "convey" a work means any kind of propagation that enables other
+parties to make or receive copies.  Mere interaction with a user through
+a computer network, with no transfer of a copy, is not conveying.
+
+  An interactive user interface displays "Appropriate Legal Notices"
+to the extent that it includes a convenient and prominently visible
+feature that (1) displays an appropriate copyright notice, and (2)
+tells the user that there is no warranty for the work (except to the
+extent that warranties are provided), that licensees may convey the
+work under this License, and how to view a copy of this License.  If
+the interface presents a list of user commands or options, such as a
+menu, a prominent item in the list meets this criterion.
+
+  1. Source Code.
+
+  The "source code" for a work means the preferred form of the work
+for making modifications to it.  "Object code" means any non-source
+form of a work.
+
+  A "Standard Interface" means an interface that either is an official
+standard defined by a recognized standards body, or, in the case of
+interfaces specified for a particular programming language, one that
+is widely used among developers working in that language.
+
+  The "System Libraries" of an executable work include anything, other
+than the work as a whole, that (a) is included in the normal form of
+packaging a Major Component, but which is not part of that Major
+Component, and (b) serves only to enable use of the work with that
+Major Component, or to implement a Standard Interface for which an
+implementation is available to the public in source code form.  A
+"Major Component", in this context, means a major essential component
+(kernel, window system, and so on) of the specific operating system
+(if any) on which the executable work runs, or a compiler used to
+produce the work, or an object code interpreter used to run it.
+
+  The "Corresponding Source" for a work in object code form means all
+the source code needed to generate, install, and (for an executable
+work) run the object code and to modify the work, including scripts to
+control those activities.  However, it does not include the work's
+System Libraries, or general-purpose tools or generally available free
+programs which are used unmodified in performing those activities but
+which are not part of the work.  For example, Corresponding Source
+includes interface definition files associated with source files for
+the work, and the source code for shared libraries and dynamically
+linked subprograms that the work is specifically designed to require,
+such as by intimate data communication or control flow between those
+subprograms and other parts of the work.
+
+  The Corresponding Source need not include anything that users
+can regenerate automatically from other parts of the Corresponding
+Source.
+
+  The Corresponding Source for a work in source code form is that
+same work.
+
+  2. Basic Permissions.
+
+  All rights granted under this License are granted for the term of
+copyright on the Program, and are irrevocable provided the stated
+conditions are met.  This License explicitly affirms your unlimited
+permission to run the unmodified Program.  The output from running a
+covered work is covered by this License only if the output, given its
+content, constitutes a covered work.  This License acknowledges your
+rights of fair use or other equivalent, as provided by copyright law.
+
+  You may make, run and propagate covered works that you do not
+convey, without conditions so long as your license otherwise remains
+in force.  You may convey covered works to others for the sole purpose
+of having them make modifications exclusively for you, or provide you
+with facilities for running those works, provided that you comply with
+the terms of this License in conveying all material for which you do
+not control copyright.  Those thus making or running the covered works
+for you must do so exclusively on your behalf, under your direction
+and control, on terms that prohibit them from making any copies of
+your copyrighted material outside their relationship with you.
+
+  Conveying under any other circumstances is permitted solely under
+the conditions stated below.  Sublicensing is not allowed; section 10
+makes it unnecessary.
+
+  3. Protecting Users' Legal Rights From Anti-Circumvention Law.
+
+  No covered work shall be deemed part of an effective technological
+measure under any applicable law fulfilling obligations under article
+11 of the WIPO copyright treaty adopted on 20 December 1996, or
+similar laws prohibiting or restricting circumvention of such
+measures.
+
+  When you convey a covered work, you waive any legal power to forbid
+circumvention of technological measures to the extent such circumvention
+is effected by exercising rights under this License with respect to
+the covered work, and you disclaim any intention to limit operation or
+modification of the work as a means of enforcing, against the work's
+users, your or third parties' legal rights to forbid circumvention of
+technological measures.
+
+  4. Conveying Verbatim Copies.
+
+  You may convey verbatim copies of the Program's source code as you
+receive it, in any medium, provided that you conspicuously and
+appropriately publish on each copy an appropriate copyright notice;
+keep intact all notices stating that this License and any
+non-permissive terms added in accord with section 7 apply to the code;
+keep intact all notices of the absence of any warranty; and give all
+recipients a copy of this License along with the Program.
+
+  You may charge any price or no price for each copy that you convey,
+and you may offer support or warranty protection for a fee.
+
+  5. Conveying Modified Source Versions.
+
+  You may convey a work based on the Program, or the modifications to
+produce it from the Program, in the form of source code under the
+terms of section 4, provided that you also meet all of these conditions:
+
+    a) The work must carry prominent notices stating that you modified
+    it, and giving a relevant date.
+
+    b) The work must carry prominent notices stating that it is
+    released under this License and any conditions added under section
+    7.  This requirement modifies the requirement in section 4 to
+    "keep intact all notices".
+
+    c) You must license the entire work, as a whole, under this
+    License to anyone who comes into possession of a copy.  This
+    License will therefore apply, along with any applicable section 7
+    additional terms, to the whole of the work, and all its parts,
+    regardless of how they are packaged.  This License gives no
+    permission to license the work in any other way, but it does not
+    invalidate such permission if you have separately received it.
+
+    d) If the work has interactive user interfaces, each must display
+    Appropriate Legal Notices; however, if the Program has interactive
+    interfaces that do not display Appropriate Legal Notices, your
+    work need not make them do so.
+
+  A compilation of a covered work with other separate and independent
+works, which are not by their nature extensions of the covered work,
+and which are not combined with it such as to form a larger program,
+in or on a volume of a storage or distribution medium, is called an
+"aggregate" if the compilation and its resulting copyright are not
+used to limit the access or legal rights of the compilation's users
+beyond what the individual works permit.  Inclusion of a covered work
+in an aggregate does not cause this License to apply to the other
+parts of the aggregate.
+
+  6. Conveying Non-Source Forms.
+
+  You may convey a covered work in object code form under the terms
+of sections 4 and 5, provided that you also convey the
+machine-readable Corresponding Source under the terms of this License,
+in one of these ways:
+
+    a) Convey the object code in, or embodied in, a physical product
+    (including a physical distribution medium), accompanied by the
+    Corresponding Source fixed on a durable physical medium
+    customarily used for software interchange.
+
+    b) Convey the object code in, or embodied in, a physical product
+    (including a physical distribution medium), accompanied by a
+    written offer, valid for at least three years and valid for as
+    long as you offer spare parts or customer support for that product
+    model, to give anyone who possesses the object code either (1) a
+    copy of the Corresponding Source for all the software in the
+    product that is covered by this License, on a durable physical
+    medium customarily used for software interchange, for a price no
+    more than your reasonable cost of physically performing this
+    conveying of source, or (2) access to copy the
+    Corresponding Source from a network server at no charge.
+
+    c) Convey individual copies of the object code with a copy of the
+    written offer to provide the Corresponding Source.  This
+    alternative is allowed only occasionally and noncommercially, and
+    only if you received the object code with such an offer, in accord
+    with subsection 6b.
+
+    d) Convey the object code by offering access from a designated
+    place (gratis or for a charge), and offer equivalent access to the
+    Corresponding Source in the same way through the same place at no
+    further charge.  You need not require recipients to copy the
+    Corresponding Source along with the object code.  If the place to
+    copy the object code is a network server, the Corresponding Source
+    may be on a different server (operated by you or a third party)
+    that supports equivalent copying facilities, provided you maintain
+    clear directions next to the object code saying where to find the
+    Corresponding Source.  Regardless of what server hosts the
+    Corresponding Source, you remain obligated to ensure that it is
+    available for as long as needed to satisfy these requirements.
+
+    e) Convey the object code using peer-to-peer transmission, provided
+    you inform other peers where the object code and Corresponding
+    Source of the work are being offered to the general public at no
+    charge under subsection 6d.
+
+  A separable portion of the object code, whose source code is excluded
+from the Corresponding Source as a System Library, need not be
+included in conveying the object code work.
+
+  A "User Product" is either (1) a "consumer product", which means any
+tangible personal property which is normally used for personal, family,
+or household purposes, or (2) anything designed or sold for incorporation
+into a dwelling.  In determining whether a product is a consumer product,
+doubtful cases shall be resolved in favor of coverage.  For a particular
+product received by a particular user, "normally used" refers to a
+typical or common use of that class of product, regardless of the status
+of the particular user or of the way in which the particular user
+actually uses, or expects or is expected to use, the product.  A product
+is a consumer product regardless of whether the product has substantial
+commercial, industrial or non-consumer uses, unless such uses represent
+the only significant mode of use of the product.
+
+  "Installation Information" for a User Product means any methods,
+procedures, authorization keys, or other information required to install
+and execute modified versions of a covered work in that User Product from
+a modified version of its Corresponding Source.  The information must
+suffice to ensure that the continued functioning of the modified object
+code is in no case prevented or interfered with solely because
+modification has been made.
+
+  If you convey an object code work under this section in, or with, or
+specifically for use in, a User Product, and the conveying occurs as
+part of a transaction in which the right of possession and use of the
+User Product is transferred to the recipient in perpetuity or for a
+fixed term (regardless of how the transaction is characterized), the
+Corresponding Source conveyed under this section must be accompanied
+by the Installation Information.  But this requirement does not apply
+if neither you nor any third party retains the ability to install
+modified object code on the User Product (for example, the work has
+been installed in ROM).
+
+  The requirement to provide Installation Information does not include a
+requirement to continue to provide support service, warranty, or updates
+for a work that has been modified or installed by the recipient, or for
+the User Product in which it has been modified or installed.  Access to a
+network may be denied when the modification itself materially and
+adversely affects the operation of the network or violates the rules and
+protocols for communication across the network.
+
+  Corresponding Source conveyed, and Installation Information provided,
+in accord with this section must be in a format that is publicly
+documented (and with an implementation available to the public in
+source code form), and must require no special password or key for
+unpacking, reading or copying.
+
+  7. Additional Terms.
+
+  "Additional permissions" are terms that supplement the terms of this
+License by making exceptions from one or more of its conditions.
+Additional permissions that are applicable to the entire Program shall
+be treated as though they were included in this License, to the extent
+that they are valid under applicable law.  If additional permissions
+apply only to part of the Program, that part may be used separately
+under those permissions, but the entire Program remains governed by
+this License without regard to the additional permissions.
+
+  When you convey a copy of a covered work, you may at your option
+remove any additional permissions from that copy, or from any part of
+it.  (Additional permissions may be written to require their own
+removal in certain cases when you modify the work.)  You may place
+additional permissions on material, added by you to a covered work,
+for which you have or can give appropriate copyright permission.
+
+  Notwithstanding any other provision of this License, for material you
+add to a covered work, you may (if authorized by the copyright holders of
+that material) supplement the terms of this License with terms:
+
+    a) Disclaiming warranty or limiting liability differently from the
+    terms of sections 15 and 16 of this License; or
+
+    b) Requiring preservation of specified reasonable legal notices or
+    author attributions in that material or in the Appropriate Legal
+    Notices displayed by works containing it; or
+
+    c) Prohibiting misrepresentation of the origin of that material, or
+    requiring that modified versions of such material be marked in
+    reasonable ways as different from the original version; or
+
+    d) Limiting the use for publicity purposes of names of licensors or
+    authors of the material; or
+
+    e) Declining to grant rights under trademark law for use of some
+    trade names, trademarks, or service marks; or
+
+    f) Requiring indemnification of licensors and authors of that
+    material by anyone who conveys the material (or modified versions of
+    it) with contractual assumptions of liability to the recipient, for
+    any liability that these contractual assumptions directly impose on
+    those licensors and authors.
+
+  All other non-permissive additional terms are considered "further
+restrictions" within the meaning of section 10.  If the Program as you
+received it, or any part of it, contains a notice stating that it is
+governed by this License along with a term that is a further
+restriction, you may remove that term.  If a license document contains
+a further restriction but permits relicensing or conveying under this
+License, you may add to a covered work material governed by the terms
+of that license document, provided that the further restriction does
+not survive such relicensing or conveying.
+
+  If you add terms to a covered work in accord with this section, you
+must place, in the relevant source files, a statement of the
+additional terms that apply to those files, or a notice indicating
+where to find the applicable terms.
+
+  Additional terms, permissive or non-permissive, may be stated in the
+form of a separately written license, or stated as exceptions;
+the above requirements apply either way.
+
+  8. Termination.
+
+  You may not propagate or modify a covered work except as expressly
+provided under this License.  Any attempt otherwise to propagate or
+modify it is void, and will automatically terminate your rights under
+this License (including any patent licenses granted under the third
+paragraph of section 11).
+
+  However, if you cease all violation of this License, then your
+license from a particular copyright holder is reinstated (a)
+provisionally, unless and until the copyright holder explicitly and
+finally terminates your license, and (b) permanently, if the copyright
+holder fails to notify you of the violation by some reasonable means
+prior to 60 days after the cessation.
+
+  Moreover, your license from a particular copyright holder is
+reinstated permanently if the copyright holder notifies you of the
+violation by some reasonable means, this is the first time you have
+received notice of violation of this License (for any work) from that
+copyright holder, and you cure the violation prior to 30 days after
+your receipt of the notice.
+
+  Termination of your rights under this section does not terminate the
+licenses of parties who have received copies or rights from you under
+this License.  If your rights have been terminated and not permanently
+reinstated, you do not qualify to receive new licenses for the same
+material under section 10.
+
+  9. Acceptance Not Required for Having Copies.
+
+  You are not required to accept this License in order to receive or
+run a copy of the Program.  Ancillary propagation of a covered work
+occurring solely as a consequence of using peer-to-peer transmission
+to receive a copy likewise does not require acceptance.  However,
+nothing other than this License grants you permission to propagate or
+modify any covered work.  These actions infringe copyright if you do
+not accept this License.  Therefore, by modifying or propagating a
+covered work, you indicate your acceptance of this License to do so.
+
+  10. Automatic Licensing of Downstream Recipients.
+
+  Each time you convey a covered work, the recipient automatically
+receives a license from the original licensors, to run, modify and
+propagate that work, subject to this License.  You are not responsible
+for enforcing compliance by third parties with this License.
+
+  An "entity transaction" is a transaction transferring control of an
+organization, or substantially all assets of one, or subdividing an
+organization, or merging organizations.  If propagation of a covered
+work results from an entity transaction, each party to that
+transaction who receives a copy of the work also receives whatever
+licenses to the work the party's predecessor in interest had or could
+give under the previous paragraph, plus a right to possession of the
+Corresponding Source of the work from the predecessor in interest, if
+the predecessor has it or can get it with reasonable efforts.
+
+  You may not impose any further restrictions on the exercise of the
+rights granted or affirmed under this License.  For example, you may
+not impose a license fee, royalty, or other charge for exercise of
+rights granted under this License, and you may not initiate litigation
+(including a cross-claim or counterclaim in a lawsuit) alleging that
+any patent claim is infringed by making, using, selling, offering for
+sale, or importing the Program or any portion of it.
+
+  11. Patents.
+
+  A "contributor" is a copyright holder who authorizes use under this
+License of the Program or a work on which the Program is based.  The
+work thus licensed is called the contributor's "contributor version".
+
+  A contributor's "essential patent claims" are all patent claims
+owned or controlled by the contributor, whether already acquired or
+hereafter acquired, that would be infringed by some manner, permitted
+by this License, of making, using, or selling its contributor version,
+but do not include claims that would be infringed only as a
+consequence of further modification of the contributor version.  For
+purposes of this definition, "control" includes the right to grant
+patent sublicenses in a manner consistent with the requirements of
+this License.
+
+  Each contributor grants you a non-exclusive, worldwide, royalty-free
+patent license under the contributor's essential patent claims, to
+make, use, sell, offer for sale, import and otherwise run, modify and
+propagate the contents of its contributor version.
+
+  In the following three paragraphs, a "patent license" is any express
+agreement or commitment, however denominated, not to enforce a patent
+(such as an express permission to practice a patent or covenant not to
+sue for patent infringement).  To "grant" such a patent license to a
+party means to make such an agreement or commitment not to enforce a
+patent against the party.
+
+  If you convey a covered work, knowingly relying on a patent license,
+and the Corresponding Source of the work is not available for anyone
+to copy, free of charge and under the terms of this License, through a
+publicly available network server or other readily accessible means,
+then you must either (1) cause the Corresponding Source to be so
+available, or (2) arrange to deprive yourself of the benefit of the
+patent license for this particular work, or (3) arrange, in a manner
+consistent with the requirements of this License, to extend the patent
+license to downstream recipients.  "Knowingly relying" means you have
+actual knowledge that, but for the patent license, your conveying the
+covered work in a country, or your recipient's use of the covered work
+in a country, would infringe one or more identifiable patents in that
+country that you have reason to believe are valid.
+
+  If, pursuant to or in connection with a single transaction or
+arrangement, you convey, or propagate by procuring conveyance of, a
+covered work, and grant a patent license to some of the parties
+receiving the covered work authorizing them to use, propagate, modify
+or convey a specific copy of the covered work, then the patent license
+you grant is automatically extended to all recipients of the covered
+work and works based on it.
+
+  A patent license is "discriminatory" if it does not include within
+the scope of its coverage, prohibits the exercise of, or is
+conditioned on the non-exercise of one or more of the rights that are
+specifically granted under this License.  You may not convey a covered
+work if you are a party to an arrangement with a third party that is
+in the business of distributing software, under which you make payment
+to the third party based on the extent of your activity of conveying
+the work, and under which the third party grants, to any of the
+parties who would receive the covered work from you, a discriminatory
+patent license (a) in connection with copies of the covered work
+conveyed by you (or copies made from those copies), or (b) primarily
+for and in connection with specific products or compilations that
+contain the covered work, unless you entered into that arrangement,
+or that patent license was granted, prior to 28 March 2007.
+
+  Nothing in this License shall be construed as excluding or limiting
+any implied license or other defenses to infringement that may
+otherwise be available to you under applicable patent law.
+
+  12. No Surrender of Others' Freedom.
+
+  If conditions are imposed on you (whether by court order, agreement or
+otherwise) that contradict the conditions of this License, they do not
+excuse you from the conditions of this License.  If you cannot convey a
+covered work so as to satisfy simultaneously your obligations under this
+License and any other pertinent obligations, then as a consequence you may
+not convey it at all.  For example, if you agree to terms that obligate you
+to collect a royalty for further conveying from those to whom you convey
+the Program, the only way you could satisfy both those terms and this
+License would be to refrain entirely from conveying the Program.
+
+  13. Remote Network Interaction; Use with the GNU General Public License.
+
+  Notwithstanding any other provision of this License, if you modify the
+Program, your modified version must prominently offer all users
+interacting with it remotely through a computer network (if your version
+supports such interaction) an opportunity to receive the Corresponding
+Source of your version by providing access to the Corresponding Source
+from a network server at no charge, through some standard or customary
+means of facilitating copying of software.  This Corresponding Source
+shall include the Corresponding Source for any work covered by version 3
+of the GNU General Public License that is incorporated pursuant to the
+following paragraph.
+
+  Notwithstanding any other provision of this License, you have
+permission to link or combine any covered work with a work licensed
+under version 3 of the GNU General Public License into a single
+combined work, and to convey the resulting work.  The terms of this
+License will continue to apply to the part which is the covered work,
+but the work with which it is combined will remain governed by version
+3 of the GNU General Public License.
+
+  14. Revised Versions of this License.
+
+  The Free Software Foundation may publish revised and/or new versions of
+the GNU Affero General Public License from time to time.  Such new versions
+will be similar in spirit to the present version, but may differ in detail to
+address new problems or concerns.
+
+  Each version is given a distinguishing version number.  If the
+Program specifies that a certain numbered version of the GNU Affero General
+Public License "or any later version" applies to it, you have the
+option of following the terms and conditions either of that numbered
+version or of any later version published by the Free Software
+Foundation.  If the Program does not specify a version number of the
+GNU Affero General Public License, you may choose any version ever published
+by the Free Software Foundation.
+
+  If the Program specifies that a proxy can decide which future
+versions of the GNU Affero General Public License can be used, that proxy's
+public statement of acceptance of a version permanently authorizes you
+to choose that version for the Program.
+
+  Later license versions may give you additional or different
+permissions.  However, no additional obligations are imposed on any
+author or copyright holder as a result of your choosing to follow a
+later version.
+
+  15. Disclaimer of Warranty.
+
+  THERE IS NO WARRANTY FOR THE PROGRAM, TO THE EXTENT PERMITTED BY
+APPLICABLE LAW.  EXCEPT WHEN OTHERWISE STATED IN WRITING THE COPYRIGHT
+HOLDERS AND/OR OTHER PARTIES PROVIDE THE PROGRAM "AS IS" WITHOUT WARRANTY
+OF ANY KIND, EITHER EXPRESSED OR IMPLIED, INCLUDING, BUT NOT LIMITED TO,
+THE IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR
+PURPOSE.  THE ENTIRE RISK AS TO THE QUALITY AND PERFORMANCE OF THE PROGRAM
+IS WITH YOU.  SHOULD THE PROGRAM PROVE DEFECTIVE, YOU ASSUME THE COST OF
+ALL NECESSARY SERVICING, REPAIR OR CORRECTION.
+
+  16. Limitation of Liability.
+
+  IN NO EVENT UNLESS REQUIRED BY APPLICABLE LAW OR AGREED TO IN WRITING
+WILL ANY COPYRIGHT HOLDER, OR ANY OTHER PARTY WHO MODIFIES AND/OR CONVEYS
+THE PROGRAM AS PERMITTED ABOVE, BE LIABLE TO YOU FOR DAMAGES, INCLUDING ANY
+GENERAL, SPECIAL, INCIDENTAL OR CONSEQUENTIAL DAMAGES ARISING OUT OF THE
+USE OR INABILITY TO USE THE PROGRAM (INCLUDING BUT NOT LIMITED TO LOSS OF
+DATA OR DATA BEING RENDERED INACCURATE OR LOSSES SUSTAINED BY YOU OR THIRD
+PARTIES OR A FAILURE OF THE PROGRAM TO OPERATE WITH ANY OTHER PROGRAMS),
+EVEN IF SUCH HOLDER OR OTHER PARTY HAS BEEN ADVISED OF THE POSSIBILITY OF
+SUCH DAMAGES.
+
+  17. Interpretation of Sections 15 and 16.
+
+  If the disclaimer of warranty and limitation of liability provided
+above cannot be given local legal effect according to their terms,
+reviewing courts shall apply local law that most closely approximates
+an absolute waiver of all civil liability in connection with the
+Program, unless a warranty or assumption of liability accompanies a
+copy of the Program in return for a fee.
+
+                     END OF TERMS AND CONDITIONS
+
+            How to Apply These Terms to Your New Programs
+
+  If you develop a new program, and you want it to be of the greatest
+possible use to the public, the best way to achieve this is to make it
+free software which everyone can redistribute and change under these terms.
+
+  To do so, attach the following notices to the program.  It is safest
+to attach them to the start of each source file to most effectively
+state the exclusion of warranty; and each file should have at least
+the "copyright" line and a pointer to where the full notice is found.
+
+    <one line to give the program's name and a brief idea of what it does.>
+    Copyright (C) <year>  <name of author>
+
+    This program is free software: you can redistribute it and/or modify
+    it under the terms of the GNU Affero General Public License as published
+    by the Free Software Foundation, either version 3 of the License, or
+    (at your option) any later version.
+
+    This program is distributed in the hope that it will be useful,
+    but WITHOUT ANY WARRANTY; without even the implied warranty of
+    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+    GNU Affero General Public License for more details.
+
+    You should have received a copy of the GNU Affero General Public License
+    along with this program.  If not, see <https://www.gnu.org/licenses/>.
+
+Also add information on how to contact you by electronic and paper mail.
+
+  If your software can interact with users remotely through a computer
+network, you should also make sure that it provides a way for users to
+get its source.  For example, if your program is a web application, its
+interface could display a "Source" link that leads users to an archive
+of the code.  There are many ways you could offer source, and different
+solutions will be better for different programs; see section 13 for the
+specific requirements.
+
+  You should also get your employer (if you work as a programmer) or school,
+if any, to sign a "copyright disclaimer" for the program, if necessary.
+For more information on this, and how to apply and follow the GNU AGPL, see
+<https://www.gnu.org/licenses/>.
+
+
+--- File: ./print.bash ---
+#!/bin/bash
+
+# Define the output file name
+output_file="print.txt"
+# Define the starting directory (current directory)
+start_dir="."
+
+# --- Safety Check ---
+# Check if the output file already exists in the start directory
+# If we don't exclude it, 'find' might find it and try to cat it into itself.
+# We will exclude it using -path and -prune in the find command below.
+output_path="./${output_file}" # Construct the relative path for exclusion
+
+# --- Initialization ---
+# Clear the output file or create it if it doesn't exist
+# The '>' operator truncates the file if it exists or creates it if it doesn't.
+> "$output_file"
+echo "Initialized (or cleared) $output_file."
+
+echo "Starting to process files recursively from '$start_dir'..."
+
+# --- Core Logic: Find and Process Files ---
+# Use 'find' to locate files and execute commands for each file found.
+#
+# Explanation of the find command:
+# '.'                 : Start searching from the current directory.
+# -path "$output_path" : Match the exact relative path of our output file.
+# -prune              : If the path matches, do not descend into it (if it were a directory)
+#                       and do not process it further. This effectively excludes print.txt.
+# -o                  : OR operator. The action applies if the '-prune' wasn't triggered.
+# -type f             : Consider only regular files (not directories, links, etc.).
+# -exec sh -c '...' _ {} \; : For each file found (represented by {}):
+#   sh -c '...'       : Execute a mini-shell script.
+#   _                 : A placeholder for the script name ($0 inside the sh -c).
+#   {}                : The found file path is passed as the first argument ($1) to the mini-script.
+#   \;                : Terminates the -exec command.
+#
+# Inside the sh -c '...' script:
+#   filepath="$1"     : Assign the passed file path ($1) to a variable for clarity.
+#   echo "--- File: ${filepath} ---" >> "$output_file" : Append the header with the file path.
+#   cat "${filepath}" >> "$output_file"               : Append the content of the file.
+#                                                       Using quotes handles filenames with spaces/special chars.
+#   echo "" >> "$output_file"                         : Append a blank line for separation between files.
+#   echo "" >> "$output_file"                         : Append another blank line for better readability.
+#   We use '>>' for appending to the output file.
+#   The '&&' ensures that cat only runs if echo succeeds, and the final echo only if cat succeeds.
+
+find "$start_dir" -path "$output_path" -prune -o -type f -exec sh -c '
+    filepath="$1"
+    # Append header and content to the output file
+    {
+        echo "--- File: ${filepath} ---"
+        cat "${filepath}"
+        echo "" # Add a blank line after content
+        echo "" # Add another blank line for separation
+    } >> "'"$output_file"'" || echo "Error processing ${filepath}" >&2
+' _ {} \;
+
+# --- Completion ---
+echo "Processing complete. All file contents appended to '$output_file'."
+
+# Optional: Print the number of files processed (requires counting lines with "--- File:")
+file_count=$(grep -c -- "--- File: " "$output_file")
+echo "Processed $file_count files."
+
+exit 0
+
+--- File: ./execution/position.py ---
+"""Position management functionality."""
+import logging
+from config.settings import STOP_LOSS_PCT, TAKE_PROFIT_PCT
+
+logger = logging.getLogger('execution.position')
+
+class PositionManager:
+    """Manages trading positions."""
+    
+    def __init__(self, ib_connection, order_executor):
+        """Initialize with IB connection and order executor."""
+        self.ib_connection = ib_connection
+        self.order_executor = order_executor
+        self.positions = {}  # Symbol -> position data
+    
+    def update_positions(self):
+        """Update the current positions from IB."""
+        ib = self.ib_connection.ensure_connection()
+        
+        # Get current positions from IB
+        portfolio = ib.portfolio()
+        
+        # Update our position tracking
+        for item in portfolio:
+            symbol = item.contract.symbol
+            if item.position != 0:
+                if symbol not in self.positions:
+                    # New position we're tracking
+                    self.positions[symbol] = {
+                        'contract': item.contract,
+                        'quantity': item.position,
+                        'avg_cost': item.avgCost,
+                        'market_price': item.marketPrice,
+                        'market_value': item.marketValue,
+                        'stop_loss_price': item.avgCost * (1 - STOP_LOSS_PCT) if item.position > 0 else item.avgCost * (1 + STOP_LOSS_PCT),
+                        'take_profit_price': item.avgCost * (1 + TAKE_PROFIT_PCT) if item.position > 0 else item.avgCost * (1 - TAKE_PROFIT_PCT)
+                    }
+                else:
+                    # Update existing position
+                    self.positions[symbol].update({
+                        'quantity': item.position,
+                        'market_price': item.marketPrice,
+                        'market_value': item.marketValue
+                    })
+            elif symbol in self.positions:
+                # Position closed
+                del self.positions[symbol]
+        
+        logger.info(f"Updated positions: {len(self.positions)} active positions")
+        return self.positions
+    
+    def manage_open_positions(self):
+        """Check and manage existing positions (stop loss, etc)."""
+        self.update_positions()
+        
+        for symbol, position in list(self.positions.items()):
+            contract = position['contract']
+            quantity = position['quantity']
+            market_price = position['market_price']
+            
+            # Check stop loss
+            if quantity > 0 and market_price <= position['stop_loss_price']:
+                logger.info(f"Stop loss triggered for {symbol} at {market_price}")
+                self.order_executor.place_market_order(contract, 'SELL', abs(quantity))
+            
+            # Check take profit
+            elif quantity > 0 and market_price >= position['take_profit_price']:
+                logger.info(f"Take profit triggered for {symbol} at {market_price}")
+                self.order_executor.place_market_order(contract, 'SELL', abs(quantity))
+            
+            # Short position stop loss
+            elif quantity < 0 and market_price >= position['stop_loss_price']:
+                logger.info(f"Stop loss triggered for short position {symbol} at {market_price}")
+                self.order_executor.place_market_order(contract, 'BUY', abs(quantity))
+    
+    def get_position_count(self):
+        """Get the current number of positions."""
+        return len(self.positions)
+    
+    def has_position(self, symbol):
+        """Check if we have a position for the given symbol."""
+        return symbol in self.positions
+
+--- File: ./execution/__init__.py ---
+
+
+--- File: ./execution/order.py ---
+"""Order execution functionality."""
+import logging
+from ib_insync import MarketOrder, StopOrder, LimitOrder
+
+logger = logging.getLogger('execution.order')
+
+class OrderExecutor:
+    """Handles order execution."""
+    
+    def __init__(self, ib_connection, market_hours_checker, is_paper=False):
+        """Initialize with an IB connection."""
+        self.ib_connection = ib_connection
+        self.market_hours_checker = market_hours_checker
+        self.is_paper = is_paper
+    
+    def place_market_order(self, contract, action, quantity):
+        """Place a market order.
+        
+        Args:
+            contract: IB contract object
+            action: 'BUY' or 'SELL'
+            quantity: Number of shares
+            
+        Returns:
+            dict: Order information if successful, None otherwise
+        """
+        ib = self.ib_connection.ensure_connection()
+        
+        # Check if market is open
+        if not self.market_hours_checker.is_market_open(contract):
+            logger.warning(f"Market closed for {contract.symbol}, skipping order")
+            return None
+        
+        try:
+            # Create and place the order
+            order = MarketOrder(action, quantity)
+            
+            # Log paper trading if enabled
+            if self.is_paper:
+                logger.info(f"[PAPER] Placed {action} market order for {quantity} shares of {contract.symbol}")
+                
+                # Simulate a fill with current market price
+                current_price = None
+                ticker = ib.reqMktData(contract)
+                for _ in range(5):  # Try for 5 seconds
+                    ib.waitOnUpdate(timeout=1)
+                    current_price = ticker.marketPrice()
+                    if current_price > 0:
+                        break
+                
+                # Cancel market data subscription
+                ib.cancelMktData(contract)
+                
+                if current_price and current_price > 0:
+                    # Return simulated fill info
+                    return {
+                        'status': 'filled',
+                        'fill_price': current_price,
+                        'quantity': quantity,
+                        'action': action,
+                        'paper_trade': True
+                    }
+                else:
+                    logger.error("[PAPER] Could not get market price for simulation")
+                    return None
+            
+            # Real trading
+            trade = ib.placeOrder(contract, order)
+            logger.info(f"Placed {action} market order for {quantity} shares of {contract.symbol}")
+            
+            # Wait for order to fill
+            for i in range(10):  # Try for a limited time
+                ib.waitOnUpdate(timeout=5)
+                if trade.isDone():
+                    break
+            
+            # Check status
+            if trade.orderStatus.status == 'Filled':
+                fill_price = trade.orderStatus.avgFillPrice
+                logger.info(f"Order filled at {fill_price}")
+                
+                return {
+                    'status': 'filled',
+                    'fill_price': fill_price,
+                    'quantity': quantity,
+                    'action': action,
+                    'paper_trade': False,
+                    'commission': trade.orderStatus.commission if hasattr(trade.orderStatus, 'commission') else 0
+                }
+            else:
+                logger.error(f"Order not filled: {trade.orderStatus.status}")
+                return None
+                
+        except Exception as e:
+            logger.error(f"Error placing order for {contract.symbol}: {e}")
+            return None
+    
+    def place_stop_order(self, contract, action, quantity, stop_price):
+        """Place a stop order."""
+        ib = self.ib_connection.ensure_connection()
+        
+        # Paper trading simulation
+        if self.is_paper:
+            logger.info(f"[PAPER] Placed {action} stop order for {quantity} shares of {contract.symbol} at {stop_price}")
+            return {
+                'status': 'submitted',
+                'stop_price': stop_price,
+                'quantity': quantity,
+                'action': action,
+                'paper_trade': True
+            }
+        
+        try:
+            order = StopOrder(action, quantity, stop_price)
+            trade = ib.placeOrder(contract, order)
+            logger.info(f"Placed {action} stop order for {quantity} shares of {contract.symbol} at {stop_price}")
+            return trade
+        except Exception as e:
+            logger.error(f"Error placing stop order for {contract.symbol}: {e}")
+            return None
+
+--- File: ./tests/test.py ---
+"""Backtesting framework for trading strategies."""
+import os
+import sys
+import pandas as pd
+import numpy as np
+import json
+from datetime import datetime, timedelta
+import matplotlib.pyplot as plt
+from tqdm import tqdm
+import logging
+
+# Add parent directory to path to import project modules
+sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
+from strategies.base_strategy import BaseStrategy
+from strategies.moving_average import MovingAverageCrossover
+from strategies.enhanced_ma import EnhancedMovingAverage
+from strategies.volatility import VolatilityBreakout
+from strategies.mean_reversion import MeanReversionStrategy
+from strategies.ensemble import EnsembleStrategy
+from data.historical import HistoricalDataProvider
+from utils.logging_config import setup_logging
+
+# Configure logging for tests
+logger = logging.getLogger('eco_etf_bot.tests.backtest')
+
+class MockHistoricalData:
+    """Mock data provider for backtesting."""
+    
+    def __init__(self, data_dict):
+        """Initialize with preloaded historical data."""
+        self.data = data_dict
+    
+    def get_historical_data(self, contract, duration=None, bar_size='1 day',
+                           what_to_show='MIDPOINT', use_rth=True):
+        """Get historical data from preloaded data."""
+        symbol = contract.symbol
+        if symbol in self.data:
+            return self.data[symbol].copy()
+        return None
+    
+    def calculate_indicators(self, df, sma_short=5, sma_long=20):
+        """Calculate indicators on a dataframe."""
+        if df is None or len(df) < sma_long:
+            return None
+            
+        # Make a copy to avoid modifying the original
+        result = df.copy()
+        
+        # Calculate simple moving averages
+        result[f'SMA{sma_short}'] = result['close'].rolling(sma_short).mean()
+        result[f'SMA{sma_long}'] = result['close'].rolling(sma_long).mean()
+        
+        # Calculate volatility (20-day rolling standard deviation of returns)
+        result['returns'] = result['close'].pct_change()
+        result['volatility'] = result['returns'].rolling(20).std() * (252 ** 0.5)  # Annualized
+        
+        return result
+
+class Backtest:
+    """Backtest trading strategies on historical data."""
+    
+    def __init__(self, data_folder='backtest_data', output_folder='test_results'):
+        """Initialize the backtest engine."""
+        self.data_folder = data_folder
+        self.output_folder = output_folder
+        
+        # Create output folder if it doesn't exist
+        if not os.path.exists(output_folder):
+            os.makedirs(output_folder)
+        
+        # Create data folder if it doesn't exist
+        if not os.path.exists(data_folder):
+            os.makedirs(data_folder)
+            
+        self.strategies = {}
+        self.results = {}
+    
+    def load_data(self, symbols, days=252):
+        """Load or download historical data for symbols.
+        
+        Args:
+            symbols: List of symbols to test
+            days: Number of trading days to test (default 1 year)
+            
+        Returns:
+            dict: Symbol -> DataFrame with historical data
+        """
+        data = {}
+        
+        # Check if we have cached data
+        for symbol in symbols:
+            data_file = os.path.join(self.data_folder, f"{symbol}_data.csv")
+            
+            if os.path.exists(data_file):
+                # Load data from file
+                df = pd.read_csv(data_file, parse_dates=['date'])
+                
+                # Only use the requested number of days
+                if len(df) > days:
+                    df = df.tail(days)
+                
+                data[symbol] = df
+                logger.info(f"Loaded {len(df)} days of data for {symbol}")
+            else:
+                # We would download data here in a real implementation
+                # For now, we'll just create mock data
+                logger.warning(f"No cached data for {symbol}, creating mock data")
+                
+                # Create mock data for testing
+                date_range = pd.date_range(end=datetime.now(), periods=days, freq='B')
+                mock_data = pd.DataFrame({
+                    'date': date_range,
+                    'open': np.random.normal(100, 10, size=days).cumsum(),
+                    'high': np.random.normal(100, 10, size=days).cumsum() + 2,
+                    'low': np.random.normal(100, 10, size=days).cumsum() - 2,
+                    'close': np.random.normal(100, 10, size=days).cumsum(),
+                    'volume': np.random.randint(1000, 1000000, size=days)
+                })
+                
+                # Save mock data for reuse
+                mock_data.to_csv(data_file, index=False)
+                
+                data[symbol] = mock_data
+        
+        return data
+    
+    def register_strategies(self):
+        """Register all available strategies for testing."""
+        # Create mock data provider
+        mock_data_provider = MockHistoricalData({})  # Will be updated before running tests
+        
+        # Register all strategies
+        self.strategies['MovingAverage'] = MovingAverageCrossover(mock_data_provider)
+        self.strategies['EnhancedMA'] = EnhancedMovingAverage(mock_data_provider)
+        self.strategies['Volatility'] = VolatilityBreakout(mock_data_provider)
+        self.strategies['MeanReversion'] = MeanReversionStrategy(mock_data_provider)
+        
+        # Create ensemble strategy
+        self.strategies['Ensemble'] = EnsembleStrategy(
+            mock_data_provider,
+            strategies=[
+                MovingAverageCrossover(mock_data_provider),
+                EnhancedMovingAverage(mock_data_provider),
+                VolatilityBreakout(mock_data_provider),
+                MeanReversionStrategy(mock_data_provider)
+            ],
+            weights=[0.1, 0.3, 0.3, 0.3]
+        )
+        
+        return self.strategies
+    
+    def run_backtest(self, symbols, days=252, initial_capital=100000):
+        """Run backtest on historical data for all registered strategies.
+        
+        Args:
+            symbols: List of symbols to test
+            days: Number of trading days to test
+            initial_capital: Initial capital for portfolio
+            
+        Returns:
+            dict: Strategy name -> backtest results
+        """
+        # Load historical data
+        data = self.load_data(symbols, days)
+        
+        # Register strategies if not already done
+        if not self.strategies:
+            self.register_strategies()
+        
+        # Update mock data provider for each strategy
+        for strategy_name, strategy in self.strategies.items():
+            strategy.data_provider.data = data
+        
+        # Run backtest for each strategy
+        results = {}
+        
+        for strategy_name, strategy in self.strategies.items():
+            logger.info(f"Running backtest for {strategy_name} strategy")
+            
+            # Initialize results for this strategy
+            strategy_results = {
+                'portfolio_value': [],
+                'cash': [],
+                'positions': [],
+                'trades': [],
+                'equity_curve': [initial_capital],
+                'symbols': symbols,
+                'days': days
+            }
+            
+            # Create a portfolio for backtesting
+            portfolio = {
+                'cash': initial_capital,
+                'positions': {},
+                'trades': []
+            }
+            
+            # Determine the common date range for all symbols
+            common_dates = None
+            for symbol in symbols:
+                if symbol in data:
+                    symbol_dates = data[symbol]['date']
+                    if common_dates is None:
+                        common_dates = set(symbol_dates)
+                    else:
+                        common_dates = common_dates.intersection(set(symbol_dates))
+            
+            if not common_dates:
+                logger.error("No common dates found across symbols")
+                continue
+            
+            # Sort common dates
+            common_dates = sorted(list(common_dates))
+            
+            # Only use the requested number of days
+            if len(common_dates) > days:
+                common_dates = common_dates[-days:]
+            
+            # Run the backtest day by day
+            for day_idx, current_date in enumerate(tqdm(common_dates, desc=f"Testing {strategy_name}")):
+                # Skip the first few days to allow for indicator calculation
+                if day_idx < 20:  # Need at least 20 days for most indicators
+                    continue
+                
+                # Create a dictionary to hold the data up to this date for each symbol
+                historical_data = {}
+                for symbol in symbols:
+                    if symbol in data:
+                        # Get data up to current date
+                        symbol_data = data[symbol][data[symbol]['date'] <= current_date]
+                        if len(symbol_data) > 0:
+                            historical_data[symbol] = symbol_data
+                
+                # Update mock data provider with data up to this point
+                for strat_name, strat in self.strategies.items():
+                    strat.data_provider.data = historical_data
+                
+                # Generate signals for current day
+                contracts = [{'symbol': symbol} for symbol in symbols]
+                signals = strategy.generate_signals(contracts)
+                
+                # Process signals and update portfolio
+                for symbol, signal_data in signals.items():
+                    action = signal_data['action']
+                    price = signal_data['price']
+                    
+                    # Default to 100 shares or position sizing based on volatility
+                    if 'volatility' in signal_data:
+                        # Simple volatility-based position sizing
+                        volatility = signal_data['volatility']
+                        target_risk = portfolio['cash'] * 0.01  # 1% risk per trade
+                        quantity = max(1, int(target_risk / (price * volatility * 0.1)))
+                        quantity = min(quantity, 1000)  # Cap at 1000 shares
+                    else:
+                        quantity = 100
+                    
+                    # Implement the signal
+                    if action == 'BUY' and symbol not in portfolio['positions']:
+                        # Check if we have enough cash
+                        cost = price * quantity
+                        if cost <= portfolio['cash']:
+                            # Buy the stock
+                            portfolio['positions'][symbol] = {
+                                'quantity': quantity,
+                                'entry_price': price,
+                                'entry_date': current_date,
+                                'current_price': price,
+                                'current_value': price * quantity
+                            }
+                            portfolio['cash'] -= cost
+                            
+                            # Record the trade
+                            portfolio['trades'].append({
+                                'date': current_date,
+                                'symbol': symbol,
+                                'action': 'BUY',
+                                'quantity': quantity,
+                                'price': price,
+                                'cost': cost,
+                                'strategy': strategy_name
+                            })
+                    
+                    elif action == 'SELL' and symbol in portfolio['positions']:
+                        # Sell the stock
+                        position = portfolio['positions'][symbol]
+                        proceeds = price * position['quantity']
+                        profit = proceeds - (position['entry_price'] * position['quantity'])
+                        
+                        portfolio['cash'] += proceeds
+                        
+                        # Record the trade
+                        portfolio['trades'].append({
+                            'date': current_date,
+                            'symbol': symbol,
+                            'action': 'SELL',
+                            'quantity': position['quantity'],
+                            'price': price,
+                            'proceeds': proceeds,
+                            'profit': profit,
+                            'entry_price': position['entry_price'],
+                            'entry_date': position['entry_date'],
+                            'holding_days': (pd.to_datetime(current_date) - 
+                                           pd.to_datetime(position['entry_date'])).days,
+                            'strategy': strategy_name
+                        })
+                        
+                        # Remove the position
+                        del portfolio['positions'][symbol]
+                
+                # Update current prices and values for all positions
+                for symbol, position in list(portfolio['positions'].items()):
+                    if symbol in historical_data:
+                        current_price = historical_data[symbol]['close'].iloc[-1]
+                        position['current_price'] = current_price
+                        position['current_value'] = current_price * position['quantity']
+                    else:
+                        # If we don't have data for this symbol, assume price unchanged
+                        pass
+                
+                # Calculate total portfolio value
+                portfolio_value = portfolio['cash']
+                for symbol, position in portfolio['positions'].items():
+                    portfolio_value += position['current_value']
+                
+                # Store the portfolio state for this day
+                strategy_results['portfolio_value'].append(portfolio_value)
+                strategy_results['cash'].append(portfolio['cash'])
+                strategy_results['positions'].append(portfolio['positions'].copy())
+                strategy_results['equity_curve'].append(portfolio_value)
+            
+            # Record all trades
+            strategy_results['trades'] = portfolio['trades']
+            
+            # Calculate performance metrics
+            if len(strategy_results['equity_curve']) > 1:
+                initial_value = strategy_results['equity_curve'][0]
+                final_value = strategy_results['equity_curve'][-1]
+                
+                # Total return
+                total_return = (final_value - initial_value) / initial_value * 100
+                
+                # Annualized return (assuming 252 trading days in a year)
+                days_held = len(strategy_results['equity_curve']) - 1
+                annual_return = ((final_value / initial_value) ** (252 / days_held) - 1) * 100 if days_held > 0 else 0
+                
+                # Convert equity curve to pandas series for calculations
+                equity_series = pd.Series(strategy_results['equity_curve'])
+                
+                # Calculate daily returns
+                daily_returns = equity_series.pct_change().dropna()
+                
+                # Volatility (annualized)
+                volatility = daily_returns.std() * np.sqrt(252) * 100
+                
+                # Sharpe ratio (assuming risk-free rate of 0% for simplicity)
+                sharpe = (daily_returns.mean() * 252) / (daily_returns.std() * np.sqrt(252)) if daily_returns.std() > 0 else 0
+                
+                # Maximum drawdown
+                rolling_max = equity_series.cummax()
+                drawdown = ((equity_series - rolling_max) / rolling_max) * 100
+                max_drawdown = drawdown.min()
+                
+                # Win rate
+                trades = strategy_results['trades']
+                winning_trades = [t for t in trades if t.get('profit', 0) > 0]
+                win_rate = len(winning_trades) / len(trades) * 100 if trades else 0
+                
+                # Average profit per trade
+                if trades:
+                    total_profit = sum(t.get('profit', 0) for t in trades)
+                    avg_profit = total_profit / len(trades)
+                    avg_win = sum(t.get('profit', 0) for t in winning_trades) / len(winning_trades) if winning_trades else 0
+                    losing_trades = [t for t in trades if t.get('profit', 0) <= 0]
+                    avg_loss = sum(t.get('profit', 0) for t in losing_trades) / len(losing_trades) if losing_trades else 0
+                    profit_factor = abs(sum(t.get('profit', 0) for t in winning_trades) / 
+                                      sum(t.get('profit', 0) for t in losing_trades)) if losing_trades and sum(t.get('profit', 0) for t in losing_trades) != 0 else float('inf')
+                else:
+                    total_profit = 0
+                    avg_profit = 0
+                    avg_win = 0
+                    avg_loss = 0
+                    profit_factor = 0
+                
+                # Store metrics
+                strategy_results['metrics'] = {
+                    'initial_capital': initial_value,
+                    'final_value': final_value,
+                    'total_return_pct': total_return,
+                    'annual_return_pct': annual_return,
+                    'volatility_pct': volatility,
+                    'sharpe_ratio': sharpe,
+                    'max_drawdown_pct': max_drawdown,
+                    'win_rate_pct': win_rate,
+                    'trade_count': len(trades),
+                    'total_profit': total_profit,
+                    'avg_profit_per_trade': avg_profit,
+                    'avg_win': avg_win,
+                    'avg_loss': avg_loss,
+                    'profit_factor': profit_factor
+                }
+            
+            # Store results for this strategy
+            results[strategy_name] = strategy_results
+        
+        # Store all results
+        self.results = results
+        
+        return results
+    
+    def plot_results(self, show_plots=True):
+        """Plot backtest results."""
+        if not self.results:
+            logger.error("No backtest results to plot")
+            return
+        
+        # Create plots folder if it doesn't exist
+        plots_folder = os.path.join(self.output_folder, 'plots')
+        if not os.path.exists(plots_folder):
+            os.makedirs(plots_folder)
+        
+        # Equity curves
+        plt.figure(figsize=(12, 8))
+        for strategy_name, results in self.results.items():
+            if 'equity_curve' in results:
+                plt.plot(results['equity_curve'], label=strategy_name)
+        
+        plt.title('Portfolio Equity Curves')
+        plt.xlabel('Trading Days')
+        plt.ylabel('Portfolio Value ($)')
+        plt.legend()
+        plt.grid(True)
+        
+        # Save the plot
+        plt.savefig(os.path.join(plots_folder, 'equity_curves.png'))
+        
+        if show_plots:
+            plt.show()
+        
+        # Performance comparison chart
+        metrics = ['total_return_pct', 'annual_return_pct', 'sharpe_ratio', 'max_drawdown_pct', 'win_rate_pct']
+        metric_labels = ['Total Return (%)', 'Annual Return (%)', 'Sharpe Ratio', 'Max Drawdown (%)', 'Win Rate (%)']
+        
+        # Extract metrics for each strategy
+        strategy_metrics = {}
+        for strategy_name, results in self.results.items():
+            if 'metrics' in results:
+                strategy_metrics[strategy_name] = [results['metrics'].get(m, 0) for m in metrics]
+        
+        if strategy_metrics:
+            # Create bar chart for each metric
+            for i, (metric, label) in enumerate(zip(metrics, metric_labels)):
+                plt.figure(figsize=(10, 6))
+                
+                strategies = list(strategy_metrics.keys())
+                values = [results['metrics'].get(metric, 0) for strategy, results in self.results.items() 
+                         if strategy in strategies and 'metrics' in results]
+                
+                bars = plt.bar(strategies, values)
+                
+                # Add value labels on top of bars
+                for bar in bars:
+                    height = bar.get_height()
+                    plt.text(bar.get_x() + bar.get_width()/2., height,
+                            f'{height:.2f}',
+                            ha='center', va='bottom')
+                
+                plt.title(f'Strategy Comparison: {label}')
+                plt.ylabel(label)
+                plt.grid(axis='y', linestyle='--', alpha=0.7)
+                
+                # Save the plot
+                plt.savefig(os.path.join(plots_folder, f'comparison_{metric}.png'))
+                
+                if show_plots:
+                    plt.show()
+                else:
+                    plt.close()
+    
+    def save_results(self):
+        """Save backtest results to files."""
+        if not self.results:
+            logger.error("No backtest results to save")
+            return
+        
+        # Create a timestamp for the results
+        timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+        
+        # Save results to JSON
+        results_file = os.path.join(self.output_folder, f'backtest_results_{timestamp}.json')
+        
+        # Prepare results for JSON serialization
+        json_results = {}
+        for strategy_name, results in self.results.items():
+            # Convert positions to serializable format
+            serializable_results = results.copy()
+            
+            # Handle positions (list of dicts)
+            if 'positions' in serializable_results:
+                serializable_positions = []
+                for day_positions in serializable_results['positions']:
+                    serializable_day = {}
+                    for symbol, pos in day_positions.items():
+                        serializable_day[symbol] = {
+                            'quantity': pos['quantity'],
+                            'entry_price': float(pos['entry_price']),
+                            'current_price': float(pos['current_price']),
+                            'current_value': float(pos['current_value'])
+                        }
+                        if 'entry_date' in pos:
+                            serializable_day[symbol]['entry_date'] = str(pos['entry_date'])
+                    serializable_positions.append(serializable_day)
+                serializable_results['positions'] = serializable_positions
+            
+            # Handle trades (convert dates to strings)
+            if 'trades' in serializable_results:
+                for trade in serializable_results['trades']:
+                    trade['date'] = str(trade['date'])
+                    if 'entry_date' in trade:
+                        trade['entry_date'] = str(trade['entry_date'])
+            
+            # Handle metrics (ensure all values are serializable)
+            if 'metrics' in serializable_results:
+                for key, value in serializable_results['metrics'].items():
+                    if isinstance(value, np.float64) or isinstance(value, np.float32):
+                        serializable_results['metrics'][key] = float(value)
+                    elif isinstance(value, np.int64) or isinstance(value, np.int32):
+                        serializable_results['metrics'][key] = int(value)
+            
+            json_results[strategy_name] = serializable_results
+        
+        # Save to file
+        with open(results_file, 'w') as f:
+            json.dump(json_results, f, indent=2)
+        
+        logger.info(f"Backtest results saved to {results_file}")
+        
+        # Also generate a summary CSV for easy comparison
+        summary_file = os.path.join(self.output_folder, f'backtest_summary_{timestamp}.csv')
+        
+        summary_data = []
+        for strategy_name, results in self.results.items():
+            if 'metrics' in results:
+                metrics = results['metrics']
+                summary_data.append({
+                    'Strategy': strategy_name,
+                    'Total Return (%)': metrics['total_return_pct'],
+                    'Annual Return (%)': metrics['annual_return_pct'],
+                    'Volatility (%)': metrics['volatility_pct'],
+                    'Sharpe Ratio': metrics['sharpe_ratio'],
+                    'Max Drawdown (%)': metrics['max_drawdown_pct'],
+                    'Win Rate (%)': metrics['win_rate_pct'],
+                    'Trade Count': metrics['trade_count'],
+                    'Total Profit ($)': metrics['total_profit'],
+                    'Avg Profit/Trade ($)': metrics['avg_profit_per_trade'],
+                    'Profit Factor': metrics['profit_factor']
+                })
+        
+        if summary_data:
+            summary_df = pd.DataFrame(summary_data)
+            summary_df.to_csv(summary_file, index=False)
+            logger.info(f"Backtest summary saved to {summary_file}")
+        
+        return results_file, summary_file
+    
+    def print_summary(self):
+        """Print a summary of backtest results to console."""
+        if not self.results:
+            logger.error("No backtest results to summarize")
+            return
+        
+        print("\n" + "="*80)
+        print(f"BACKTEST SUMMARY - {len(self.results)} Strategies")
+        print("="*80)
+        
+        for strategy_name, results in sorted(self.results.items(), 
+                                           key=lambda x: x[1].get('metrics', {}).get('total_return_pct', 0),
+                                           reverse=True):
+            if 'metrics' in results:
+                metrics = results['metrics']
+                print(f"\nStrategy: {strategy_name}")
+                print("-" * 50)
+                print(f"Initial Capital: ${metrics['initial_capital']:,.2f}")
+                print(f"Final Value:     ${metrics['final_value']:,.2f}")
+                print(f"Total Return:    {metrics['total_return_pct']:,.2f}%")
+                print(f"Annual Return:   {metrics['annual_return_pct']:,.2f}%")
+                print(f"Sharpe Ratio:    {metrics['sharpe_ratio']:.2f}")
+                print(f"Max Drawdown:    {metrics['max_drawdown_pct']:,.2f}%")
+                print(f"Volatility:      {metrics['volatility_pct']:,.2f}%")
+                print(f"Win Rate:        {metrics['win_rate_pct']:,.2f}%")
+                print(f"Trade Count:     {metrics['trade_count']}")
+                print(f"Profit Factor:   {metrics['profit_factor']:,.2f}")
+                
+                # Print trade statistics
+                if 'trades' in results and results['trades']:
+                    trades = results['trades']
+                    print(f"\nTrade Statistics:")
+                    print(f"  Total Trades:    {len(trades)}")
+                    print(f"  Total Profit:    ${sum(t.get('profit', 0) for t in trades):,.2f}")
+                    print(f"  Avg Profit/Trade: ${metrics['avg_profit_per_trade']:,.2f}")
+                    print(f"  Avg Win:         ${metrics['avg_win']:,.2f}")
+                    print(f"  Avg Loss:        ${metrics['avg_loss']:,.2f}")
+                    
+                    # Calculate average holding period
+                    holding_days = [t.get('holding_days', 0) for t in trades if 'holding_days' in t]
+                    if holding_days:
+                        avg_holding = sum(holding_days) / len(holding_days)
+                        print(f"  Avg Holding Days: {avg_holding:.1f}")
+        
+        print("\n" + "="*80)
+        
+        # Print overall ranking
+        print("\nSTRATEGY RANKING BY TOTAL RETURN")
+        print("-" * 50)
+        ranking = []
+        for strategy_name, results in self.results.items():
+            if 'metrics' in results:
+                ranking.append((
+                    strategy_name,
+                    results['metrics'].get('total_return_pct', 0),
+                    results['metrics'].get('sharpe_ratio', 0),
+                    results['metrics'].get('max_drawdown_pct', 0)
+                ))
+        
+        # Sort by total return
+        for i, (strategy, ret, sharpe, dd) in enumerate(sorted(ranking, key=lambda x: x[1], reverse=True)):
+            print(f"{i+1}. {strategy:15} - Return: {ret:7.2f}%, Sharpe: {sharpe:5.2f}, Max DD: {dd:7.2f}%")
+        
+        print("="*80 + "\n")
+
+def run_all_backtests(symbols, days=252, initial_capital=100000, show_plots=True):
+    """Run backtests for all strategies and generate reports."""
+    # Set up logging
+    setup_logging()
+    
+    logger.info(f"Starting backtest for {len(symbols)} symbols over {days} trading days")
+    
+    # Create backtest engine
+    backtest = Backtest()
+    
+    # Run the backtest
+    results = backtest.run_backtest(symbols, days, initial_capital)
+    
+    # Plot results
+    backtest.plot_results(show_plots)
+    
+    # Save results
+    results_file, summary_file = backtest.save_results()
+    
+    # Print summary
+    backtest.print_summary()
+    
+    return results, results_file, summary_file
+
+if __name__ == "__main__":
+    # Example usage
+    symbols = ['AAPL', 'MSFT', 'GOOGL', 'AMZN', 'TSLA']
+    results, _, _ = run_all_backtests(symbols, days=252)
+
+--- File: ./tests/READEME.md ---
+This is where I will do retroactive tests to see the efficacy of my trading bot.
+
+# Testing Framework for Eco ETF Trading Bot
+
+This directory contains tools for testing and backtesting the Eco ETF Trading Bot.
+
+## Backtesting Framework
+
+The backtesting system allows you to test all available trading strategies against historical market data and compare their performance.
+
+### Features
+
+- Test all strategies on historical data for specified symbols
+- Customizable testing period (number of trading days)
+- Detailed performance metrics:
+  - Total and annual returns
+  - Sharpe ratio
+  - Maximum drawdown
+  - Win rate
+  - Profit factor
+  - Trade statistics
+- Comparative analysis between strategies
+- Visual results (equity curves, performance charts)
+- Export results to JSON and CSV files
+
+### Usage
+
+You can run backtests directly from the command line:
+
+```bash
+# Run backtest for default ETF symbols with 1 year of data
+python main.py --backtest
+
+# Run backtest for specific symbols
+python main.py --backtest --symbols AAPL MSFT GOOGL
+
+# Run backtest for 6 months (126 trading days)
+python main.py --backtest --days 126
+
+# Run backtest with custom initial capital
+python main.py --backtest --capital 50000
+
+# Run backtest without showing plots
+python main.py --backtest --no-plots
+```
+
+### Output
+
+The backtest will generate:
+
+1. JSON Results File: Detailed results including all trades and daily portfolio values
+2. CSV Summary File: Condensed performance metrics for easy comparison
+3. Performance Charts: Equity curves and comparative performance metrics
+4. Console Output: Summary of results with strategy rankings
+
+## Data
+
+The backtest framework will use cached data when available. For initial runs, it will generate mock data or download real data if available.
+Adding New Tests
+
+To add new test types:
+
+1. Create a new Python file in the tests directory
+2. Implement your test logic
+3. (Optional) Add command-line arguments to main.py to access your test
+
+## Examples
+To use the backtesting functionality, you can run commands like:
+
+```bash
+# Run backtest for all strategies with 1 year of data
+python main.py --backtest
+
+# Run backtest for specific symbols over 3 months
+python main.py --backtest --symbols INRG RENW KGRN --days 63
+
+# Run backtest with $50,000 starting capital without showing plots
+python main.py --backtest --capital 50000 --no-plots
+
+--- File: ./utils/logging_config.py ---
+"""Logging configuration."""
+import logging
+import os
+from datetime import datetime
+from config.settings import LOG_LEVEL, LOG_FILE
+
+def setup_logging():
+    """Set up logging configuration."""
+    # Create logs directory if it doesn't exist
+    os.makedirs(os.path.dirname(LOG_FILE), exist_ok=True)
+    
+    # Set up logging
+    logging.basicConfig(
+        level=getattr(logging, LOG_LEVEL),
+        format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+        handlers=[
+            logging.FileHandler(LOG_FILE),
+            logging.StreamHandler()
+        ]
+    )
+    
+    logger = logging.getLogger('EthicalCapitalism')
+    logger.info(f"Logging initialized at {datetime.now().isoformat()}")
+    return logger
+
+--- File: ./utils/risk_management.py ---
+"""Enhanced risk management functionality."""
+import logging
+import numpy as np
+import pandas as pd
+from datetime import datetime, timedelta
+
+logger = logging.getLogger('utils.advanced_risk_management')
+
+class AdvancedRiskManager:
+    """Advanced risk management with portfolio-level controls."""
+    
+    def __init__(self, data_provider, max_portfolio_risk=0.02, max_drawdown=0.15, 
+                 max_correlation=0.7, position_sizing_method='volatility'):
+        """Initialize the advanced risk manager.
+        
+        Args:
+            data_provider: Data provider object for historical data
+            max_portfolio_risk: Maximum risk per trade as fraction of portfolio
+            max_drawdown: Maximum allowed drawdown before reducing exposure
+            max_correlation: Maximum allowed correlation between positions
+            position_sizing_method: Method to use for position sizing
+                ('volatility', 'equal', 'kelly')
+        """
+        self.data_provider = data_provider
+        self.max_portfolio_risk = max_portfolio_risk
+        self.max_drawdown = max_drawdown
+        self.max_correlation = max_correlation
+        self.position_sizing_method = position_sizing_method
+        self.correlation_matrix = None
+        self.current_drawdown = 0
+        self.peak_value = 0
+        self.trailing_stops = {}  # Symbol -> trailing stop price
+    
+    def update_portfolio_metrics(self, portfolio):
+        """Update portfolio metrics like drawdown and peak value."""
+        current_value = portfolio.get_total_value()
+        
+        # Update peak value
+        if current_value > self.peak_value:
+            self.peak_value = current_value
+        
+        # Calculate current drawdown
+        if self.peak_value > 0:
+            self.current_drawdown = (self.peak_value - current_value) / self.peak_value
+        
+        return {
+            'current_value': current_value,
+            'peak_value': self.peak_value,
+            'current_drawdown': self.current_drawdown
+        }
+    
+    def update_correlation_matrix(self, symbols, lookback_days=60):
+        """Update correlation matrix for the given symbols."""
+        if not symbols:
+            self.correlation_matrix = None
+            return None
+        
+        # Get historical data for all symbols
+        price_data = {}
+        for symbol in symbols:
+            contract = next((c for c in symbols if c.symbol == symbol), None)
+            if contract:
+                df = self.data_provider.get_historical_data(
+                    contract, duration=f'{lookback_days} D')
+                if df is not None and len(df) > 10:
+                    price_data[symbol] = df['close']
+        
+        if len(price_data) < 2:
+            self.correlation_matrix = None
+            return None
+        
+        # Create a DataFrame with all price series
+        df = pd.DataFrame(price_data)
+        
+        # Calculate returns
+        returns = df.pct_change().dropna()
+        
+        # Calculate correlation matrix
+        self.correlation_matrix = returns.corr()
+        
+        return self.correlation_matrix
+    
+    def check_correlation(self, symbol, portfolio):
+        """Check if adding a new position would exceed correlation limits."""
+        if self.correlation_matrix is None or symbol not in self.correlation_matrix:
+            return True
+        
+        # Get current positions
+        current_symbols = list(portfolio.positions.keys())
+        
+        # Check correlation with existing positions
+        for existing_symbol in current_symbols:
+            if existing_symbol in self.correlation_matrix and symbol in self.correlation_matrix:
+                correlation = self.correlation_matrix.loc[symbol, existing_symbol]
+                if abs(correlation) > self.max_correlation:
+                    logger.warning(f"Correlation between {symbol} and {existing_symbol} " 
+                                  f"is too high: {correlation:.2f}")
+                    return False
+        
+        return True
+    
+    def calculate_optimal_position_size(self, price, volatility, portfolio_value, symbol, portfolio, 
+                                       max_positions=3):
+        """Calculate position size using the selected method."""
+        # Basic checks
+        if portfolio_value <= 0:
+            return 1
+        
+        # Apply drawdown-based scaling
+        drawdown_factor = 1.0
+        if self.current_drawdown > 0:
+            # Reduce position size as drawdown increases
+            drawdown_factor = max(0.2, 1.0 - (self.current_drawdown / self.max_drawdown))
+        
+        # Calculate base risk amount
+        risk_per_trade = portfolio_value * self.max_portfolio_risk * drawdown_factor / max_positions
+        
+        if self.position_sizing_method == 'equal':
+            # Equal position sizes
+            position_value = portfolio_value / max_positions * drawdown_factor
+            position_size = int(position_value / price)
+            
+        elif self.position_sizing_method == 'kelly':
+            # Kelly criterion (simplified)
+            # Assuming win rate of 50% and reward:risk ratio based on historical data
+            win_rate = 0.5  # Default
+            
+            # Try to get better estimates if we have historical data
+            if hasattr(portfolio, 'transactions') and portfolio.transactions:
+                trades = [t for t in portfolio.transactions if t['symbol'] == symbol]
+                if trades:
+                    wins = sum(1 for t in trades if (
+                        (t['action'] == 'SELL' and t['price'] > t['entry_price']) or
+                        (t['action'] == 'BUY' and t['price'] < t['entry_price'])
+                    ))
+                    win_rate = wins / len(trades) if len(trades) > 0 else 0.5
+            
+            # Calculate reward:risk ratio (simplified)
+            reward_risk_ratio = 2.0  # Default assumption
+            
+            # Apply Kelly formula (simplified)
+            kelly_fraction = max(0, (win_rate - ((1 - win_rate) / reward_risk_ratio)))
+            
+            # Kelly is often too aggressive, so we use half Kelly
+            kelly_fraction = kelly_fraction * 0.5
+            
+            position_value = portfolio_value * kelly_fraction * drawdown_factor
+            position_size = int(position_value / price)
+            
+        else:  # Default to volatility-based sizing
+            # Convert annualized volatility to daily
+            daily_volatility = volatility / np.sqrt(252)
+            
+            # Calculate stop loss amount
+            # Either use fixed percentage or volatility-based
+            stop_loss_pct = max(0.02, daily_volatility * 2)  # At least 2%
+            stop_loss_amount = price * stop_loss_pct
+            
+            if stop_loss_amount <= 0:
+                # Fallback to volatility-based sizing
+                position_size = int(risk_per_trade / (price * daily_volatility * 3))
+            else:
+                # Risk-based position sizing
+                position_size = int(risk_per_trade / stop_loss_amount)
+        
+        # Ensure minimum and maximum position sizes
+        position_size = max(1, min(position_size, int(portfolio_value * 0.2 / price)))
+        
+        return position_size
+    
+    def check_portfolio_risk(self, portfolio, new_position_details=None):
+        """Check if adding a new position would exceed risk limits."""
+        # Update portfolio metrics
+        metrics = self.update_portfolio_metrics(portfolio)
+        
+        # Check drawdown limit
+        if metrics['current_drawdown'] >= self.max_drawdown:
+            logger.warning(f"Maximum drawdown reached: {metrics['current_drawdown']:.2%}")
+            return False
+        
+        # Check maximum positions
+        current_positions = len(portfolio.positions)
+        if current_positions >= 3:  # Max positions hardcoded here
+            return False
+        
+        # Check correlation if we have position details
+        if new_position_details and 'symbol' in new_position_details:
+            if not self.check_correlation(new_position_details['symbol'], portfolio):
+                return False
+        
+        return True
+    
+    def calculate_trailing_stop(self, symbol, current_price, position):
+        """Calculate and update trailing stop price."""
+        if symbol not in self.trailing_stops:
+            # Initialize trailing stop at fixed percentage below entry
+            entry_price = position.get('avg_cost', current_price)
+            initial_stop = entry_price * 0.95  # 5% initial stop
+            self.trailing_stops[symbol] = initial_stop
+        else:
+            # Update trailing stop if price has moved in our favor
+            new_stop = current_price * 0.95  # 5% below current price
+            if new_stop > self.trailing_stops[symbol]:
+                self.trailing_stops[symbol] = new_stop
+        
+        return self.trailing_stops[symbol]
+    
+    def should_exit_position(self, symbol, current_price, position, days_held):
+        """Determine if a position should be exited based on multiple criteria."""
+        # Check trailing stop
+        trailing_stop = self.calculate_trailing_stop(symbol, current_price, position)
+        if current_price < trailing_stop:
+            return True, "Trailing stop triggered"
+        
+        # Time-based exit
+        if days_held > 30:  # Exit after 30 days regardless of profit/loss
+            return True, "Time-based exit"
+        
+        # Profit target
+        entry_price = position.get('avg_cost', current_price)
+        if current_price >= entry_price * 1.2:  # 20% profit target
+            return True, "Profit target reached"
+        
+        # Volatility-based exit (exit if volatility spikes)
+        if 'volatility' in position and position['volatility'] > 0:
+            current_volatility = position.get('current_volatility', position['volatility'])
+            if current_volatility > position['volatility'] * 2:
+                return True, "Volatility spike"
+        
+        return False, None
+
+--- File: ./utils/__init__.py ---
+
+
+--- File: ./utils/market_hours.py ---
+"""Market hours checking functionality."""
+import logging
+from datetime import datetime, time
+import pytz
+from config.symbols import EXCHANGE_TIMEZONES
+
+logger = logging.getLogger('utils.market_hours')
+
+class MarketHoursChecker:
+    """Checks if markets are open for trading."""
+    
+    def __init__(self, ib_connection):
+        """Initialize with an IB connection."""
+        self.ib_connection = ib_connection
+        
+        # Standard market hours by exchange (simplified)
+        self.market_hours = {
+            'LSE': {'open': time(8, 0), 'close': time(16, 30), 'timezone': 'Europe/London'},
+            'XETRA': {'open': time(9, 0), 'close': time(17, 30), 'timezone': 'Europe/Berlin'},
+            'TSX': {'open': time(9, 30), 'close': time(16, 0), 'timezone': 'America/Toronto'},
+            'NASDAQ': {'open': time(9, 30), 'close': time(16, 0), 'timezone': 'America/New_York'}
+        }
+    
+    def is_market_open(self, contract):
+        """Check if the market for this contract is open.
+        
+        Args:
+            contract: IB contract object
+            
+        Returns:
+            bool: True if market is open, False otherwise
+        """
+        ib = self.ib_connection.ensure_connection()
+        
+        try:
+            # Get contract details for exchange info
+            details = ib.reqContractDetails(contract)
+            if not details:
+                logger.warning(f"Could not get contract details for {contract.symbol}")
+                return False
+            
+            exchange = contract.exchange
+            
+            # Get timezone for the exchange
+            if exchange in self.market_hours:
+                market_timezone = pytz.timezone(self.market_hours[exchange]['timezone'])
+                market_open = self.market_hours[exchange]['open']
+                market_close = self.market_hours[exchange]['close']
+                
+                # Get current time in market timezone
+                now = datetime.now(market_timezone).time()
+                
+                # Check if current time is within market hours
+                is_open = market_open <= now <= market_close
+                
+                # In a real implementation, you'd also check for holidays here
+                
+                return is_open
+            else:
+                logger.warning(f"Unknown exchange {exchange} for {contract.symbol}")
+                return False
+            
+        except Exception as e:
+            logger.error(f"Error checking market hours for {contract.symbol}: {e}")
+            return False
+
+--- File: ./main.py ---
+"""Main entry point for the Eco ETF Trading Bot."""
+import sys
+import time
+import argparse
+import os
+import json
+from datetime import datetime, timedelta
+import pandas as pd
+
+from utils.logging_config import setup_logging
+from core.connection import IBConnection
+from core.bot import EcoETFBot
+from core.portfolio import Portfolio
+from data.historical import HistoricalDataProvider
+from data.market_data import MarketDataProvider
+from strategies.moving_average import MovingAverageCrossover
+from strategies.enhanced_ma import EnhancedMovingAverage
+from strategies.volatility import VolatilityBreakout
+from strategies.mean_reversion import MeanReversionStrategy
+from strategies.ensemble import EnsembleStrategy
+from execution.order import OrderExecutor
+from execution.position import PositionManager
+from utils.market_hours import MarketHoursChecker
+from utils.risk_management import RiskManager
+from utils.advanced_risk_management import AdvancedRiskManager
+from config.settings import EXECUTION_INTERVAL
+from config.symbols import ETF_LIST
+from tests.backtest import run_all_backtests
+
+# Create stats directory if it doesn't exist
+STATS_DIR = 'stats'
+if not os.path.exists(STATS_DIR):
+    os.makedirs(STATS_DIR)
+
+# Set up trade log file
+TRADE_LOG_FILE = os.path.join(STATS_DIR, 'trade_log.json')
+
+def log_trade(trade_data):
+    """Log trade details to a JSON file for stats tracking."""
+    trade_data['timestamp'] = datetime.now().isoformat()
+    
+    # Load existing trades
+    trades = []
+    if os.path.exists(TRADE_LOG_FILE):
+        try:
+            with open(TRADE_LOG_FILE, 'r') as f:
+                trades = json.load(f)
+        except json.JSONDecodeError:
+            # File exists but is empty or corrupted
+            trades = []
+    
+    # Append new trade
+    trades.append(trade_data)
+    
+    # Save updated trades
+    with open(TRADE_LOG_FILE, 'w') as f:
+        json.dump(trades, f, indent=2)
+
+def generate_stats_summary():
+    """Generate statistics summary from trade log."""
+    if not os.path.exists(TRADE_LOG_FILE):
+        return "No trade data available."
+    
+    try:
+        with open(TRADE_LOG_FILE, 'r') as f:
+            trades = json.load(f)
+        
+        if not trades:
+            return "No trades recorded yet."
+        
+        # Convert to DataFrame for easier analysis
+        df = pd.DataFrame(trades)
+        
+        # Convert timestamp to datetime
+        df['timestamp'] = pd.to_datetime(df['timestamp'])
+        
+        # Calculate basic stats
+        total_trades = len(df)
+        winning_trades = sum(df['profit'] > 0) if 'profit' in df.columns else 0
+        losing_trades = sum(df['profit'] < 0) if 'profit' in df.columns else 0
+        win_rate = winning_trades / total_trades if total_trades > 0 else 0
+        
+        # P&L stats
+        total_profit = df['profit'].sum() if 'profit' in df.columns else 0
+        average_profit = df['profit'].mean() if 'profit' in df.columns and len(df) > 0 else 0
+        max_profit = df['profit'].max() if 'profit' in df.columns and len(df) > 0 else 0
+        max_loss = df['profit'].min() if 'profit' in df.columns and len(df) > 0 else 0
+        
+        # Strategy performance
+        strategy_performance = {}
+        if 'strategy' in df.columns:
+            for strategy in df['strategy'].unique():
+                strategy_df = df[df['strategy'] == strategy]
+                strategy_profit = strategy_df['profit'].sum() if 'profit' in strategy_df.columns else 0
+                strategy_count = len(strategy_df)
+                strategy_performance[strategy] = {
+                    'total_trades': strategy_count,
+                    'total_profit': strategy_profit,
+                    'avg_profit': strategy_profit / strategy_count if strategy_count > 0 else 0
+                }
+        
+        # Symbol performance
+        symbol_performance = {}
+        for symbol in df['symbol'].unique():
+            symbol_df = df[df['symbol'] == symbol]
+            symbol_profit = symbol_df['profit'].sum() if 'profit' in symbol_df.columns else 0
+            symbol_count = len(symbol_df)
+            symbol_performance[symbol] = {
+                'total_trades': symbol_count,
+                'total_profit': symbol_profit,
+                'avg_profit': symbol_profit / symbol_count if symbol_count > 0 else 0
+            }
+        
+        # Format the summary
+        summary = f"""
+        TRADING BOT PERFORMANCE SUMMARY
+        ==============================
+        Period: {df['timestamp'].min().strftime('%Y-%m-%d')} to {df['timestamp'].max().strftime('%Y-%m-%d')}
+        Total Trades: {total_trades}
+        Win Rate: {win_rate:.2%}
+        
+        P&L STATISTICS
+        --------------
+        Total P&L: ${total_profit:.2f}
+        Average P&L per Trade: ${average_profit:.2f}
+        Maximum Profit: ${max_profit:.2f}
+        Maximum Loss: ${max_loss:.2f}
+        
+        STRATEGY PERFORMANCE
+        -------------------
+        """
+        
+        for strategy, stats in strategy_performance.items():
+            summary += f"{strategy}: {stats['total_trades']} trades, ${stats['total_profit']:.2f} total P&L, ${stats['avg_profit']:.2f} avg\n        "
+        
+        summary += """
+        SYMBOL PERFORMANCE
+        -----------------
+        """
+        
+        for symbol, stats in symbol_performance.items():
+            summary += f"{symbol}: {stats['total_trades']} trades, ${stats['total_profit']:.2f} total P&L, ${stats['avg_profit']:.2f} avg\n        "
+        
+        return summary
+        
+    except Exception as e:
+        return f"Error generating stats summary: {e}"
+
+def parse_arguments():
+    """Parse command line arguments."""
+    parser = argparse.ArgumentParser(description='Eco ETF Trading Bot')
+    
+    parser.add_argument('--paper', action='store_true', 
+                       help='Use paper trading mode (default: live trading)')
+    
+    parser.add_argument('--strategy', type=str, default='ensemble',
+                       choices=['moving_average', 'enhanced_ma', 'volatility', 
+                               'mean_reversion', 'ensemble'],
+                       help='Trading strategy to use')
+    
+    parser.add_argument('--risk', type=str, default='advanced',
+                       choices=['basic', 'advanced'],
+                       help='Risk management approach')
+    
+    parser.add_argument('--stats', action='store_true',
+                       help='Print stats summary and exit')
+    
+    # Add backtest-related arguments
+    parser.add_argument('--backtest', action='store_true',
+                       help='Run backtesting instead of live trading')
+    
+    parser.add_argument('--days', type=int, default=252,
+                       help='Number of trading days to backtest (default: 252)')
+    
+    parser.add_argument('--capital', type=int, default=100000,
+                       help='Initial capital for backtesting (default: $100,000)')
+    
+    parser.add_argument('--symbols', nargs='+', 
+                       help='Symbols to backtest (space-separated)')
+    
+    parser.add_argument('--no-plots', action='store_true',
+                       help='Disable plotting in backtest mode')
+    
+    return parser.parse_args()
+
+def main():
+    """Main function to start the bot or run backtests."""
+    args = parse_arguments()
+    
+    # Set up logging
+    logger = setup_logging()
+    
+    # If stats flag is set, just print stats and exit
+    if args.stats:
+        print(generate_stats_summary())
+        return 0
+    
+    # If backtest flag is set, run backtests and exit
+    if args.backtest:
+        logger.info("Starting backtest mode")
+        
+        # Get symbols for backtesting
+        symbols = args.symbols if args.symbols else [etf.symbol for etf in ETF_LIST]
+        
+        # Run backtests
+        results, results_file, summary_file = run_all_backtests(
+            symbols=symbols,
+            days=args.days,
+            initial_capital=args.capital,
+            show_plots=not args.no_plots
+        )
+        
+        logger.info(f"Backtest completed. Results saved to {results_file}")
+        logger.info(f"Summary saved to {summary_file}")
+        
+        return 0
+    
+    # Normal trading mode
+    logger.info("Starting Eco ETF Trading Bot")
+    
+    # Log trading mode
+    trading_mode = "Paper Trading" if args.paper else "Live Trading"
+    logger.info(f"Trading Mode: {trading_mode}")
+    
+    try:
+        # Initialize components
+        logger.info("Initializing components...")
+        
+        # Create IB connection with appropriate client ID for paper/live
+        client_id = 1 if args.paper else 2
+        connection = IBConnection(is_paper=args.paper, client_id=client_id)
+        
+        # Create market hours checker
+        market_hours_checker = MarketHoursChecker(connection)
+        
+        # Create data providers
+        historical_data = HistoricalDataProvider(connection)
+        market_data = MarketDataProvider(connection)
+        
+        # Create portfolio manager
+        portfolio = Portfolio(connection)
+        portfolio.initialize()
+        
+        # Create risk manager based on args
+        if args.risk == 'advanced':
+            risk_manager = AdvancedRiskManager(historical_data)
+            logger.info("Using Advanced Risk Management")
+        else:
+            risk_manager = RiskManager()
+            logger.info("Using Basic Risk Management")
+        
+        # Create order executor
+        order_executor = OrderExecutor(connection, market_hours_checker, is_paper=args.paper)
+        
+        # Create position manager
+        position_manager = PositionManager(connection, order_executor)
+        
+        # Create strategy based on args
+        if args.strategy == 'moving_average':
+            strategy = MovingAverageCrossover(historical_data)
+            logger.info("Using Moving Average Crossover Strategy")
+        elif args.strategy == 'enhanced_ma':
+            strategy = EnhancedMovingAverage(historical_data)
+            logger.info("Using Enhanced Moving Average Strategy")
+        elif args.strategy == 'volatility':
+            strategy = VolatilityBreakout(historical_data)
+            logger.info("Using Volatility Breakout Strategy")
+        elif args.strategy == 'mean_reversion':
+            strategy = MeanReversionStrategy(historical_data)
+            logger.info("Using Mean Reversion Strategy")
+        elif args.strategy == 'ensemble':
+            # Create multiple strategies and combine them
+            ma_strategy = MovingAverageCrossover(historical_data)
+            enhanced_ma = EnhancedMovingAverage(historical_data)
+            vol_strategy = VolatilityBreakout(historical_data)
+            mr_strategy = MeanReversionStrategy(historical_data)
+            
+            # Create ensemble with weighted strategies
+            strategy = EnsembleStrategy(
+                historical_data,
+                strategies=[ma_strategy, enhanced_ma, vol_strategy, mr_strategy],
+                weights=[0.1, 0.3, 0.3, 0.3]  # Enhanced MA, Volatility and Mean Reversion get more weight
+            )
+            logger.info("Using Ensemble Strategy")
+        
+        # Create and run the bot with trade logging capability
+        bot = EcoETFBot(
+            connection=connection,
+            data_provider=historical_data,
+            market_data=market_data,
+            strategy=strategy,
+            position_manager=position_manager,
+            order_executor=order_executor,
+            portfolio=portfolio,
+            risk_manager=risk_manager,
+            trade_logger=log_trade,
+            is_paper=args.paper
+        )
+        
+        logger.info("Bot initialized successfully")
+        
+        # Print current portfolio status
+        logger.info(f"Starting Portfolio Value: ${portfolio.get_total_value():.2f}")
+        
+        # Run the bot
+        logger.info("Starting trading cycles...")
+        bot.run()
+        
+    except KeyboardInterrupt:
+        logger.info("Bot stopped by user")
+        
+        # Print stats summary when the bot is stopped
+        logger.info("Performance Summary:")
+        logger.info(generate_stats_summary())
+        
+    except Exception as e:
+        logger.error(f"Fatal error: {e}")
+        return 1
+        
+    return 0
+
+if __name__ == "__main__":
+    sys.exit(main())
+
+--- File: ./README.md ---
+# Ethical Capitalism
+
+My left accelerationsism contribution, a IBKR trading bot
+
+## WARNING
+
+READ THE LICENCE OF THIS BEFORE YOU TRY ANY SHIT. IF YOU MAKE THIS INTO A HEDGE FUND WITH A FORK I WILL FIND YOU AND SUE YOU FOR EVERYTHING YOU MADE.
+
+If you want to contribute to this, fork it or pull it and make a pr back to the repo. Failure to do this will also result in a lawsuit.
+
+## Method
+
+I did vibe code this, but my conception of vibe coding is not windsurf or cursor, I have had terrible TERRIBLE experience coding with those. I use claude-3.7 to generate the project structure API connections and then edit that code.
+
+For the ETF choice, I used Claude-3.7s reasoning model to do ethical and financial analysis of this data.
+
+I then edit and test the code found in the `/tests` directory.
+
+## Usage
+
+1. Install dependencies:
+
+`pip install -r requirements.txt`
+
+2. Ensure Interactive Brokers TWS or IB Gateway is running
+
+- Enable API connections in TWS/Gateway settings
+- Set API port to match the one in `config/settings.py`
+
+3. Configure your ETFs in `config/symbols.py`
+
+4. Adjust strategy parameters in `config/settings.py`
+
+5. Run the bot:
+
+```
+# Run with paper trading using the ensemble strategy
+
+python main.py --paper --strategy ensemble
+
+# Run with live trading using the mean reversion strategy
+
+python main.py --strategy mean_reversion
+
+# View stats summary without starting the bot
+
+python main.py --stats
+```
+
+## Project Structure
+
+- `config/`: Configuration files
+- `core/`: Core bot functionality
+- `data/`: Market data retrieval
+- `strategies/`: Trading strategies
+- `execution/`: Order execution and position management
+- `utils/`: Utility functions
+- `logs/`: bot logs 
+
+## Adding New Strategies
+
+To add a new strategy:
+
+1. Create a new file in the `strategies/` directory
+2. Implement a class that inherits from `BaseStrategy`
+3. Update `main.py` to use your new strategy
+
+## Disclaimer
+
+USE AT YOUR OWN RISK
+
+
+--- File: ./ibkr/Dockerfile ---
+FROM ubuntu:20.04
+
+# Install dependencies
+RUN apt-get update && apt-get install -y \
+    xvfb \
+    libxrender1 \
+    libxtst6 \
+    libxi6 \
+    x11vnc \
+    socat \
+    wget \
+    unzip \
+    openjdk-8-jre \
+    && rm -rf /var/lib/apt/lists/*
+
+# Create working directory
+WORKDIR /opt/ibgateway
+
+# Download and install IB Gateway (you'll need to update this URL)
+RUN wget -q https://download2.interactivebrokers.com/installers/ibgateway/latest-standalone/ibgateway-latest-standalone-linux-x64.sh
+RUN chmod +x ibgateway-latest-standalone-linux-x64.sh
+RUN ./ibgateway-latest-standalone-linux-x64.sh -q -dir /opt/ibgateway
+
+# Setup IBC (Interactive Brokers Controller)
+WORKDIR /opt/ibc
+RUN wget -q https://github.com/IbcAlpha/IBC/releases/download/3.12.0/IBCLinux-3.12.0.zip
+RUN unzip IBCLinux-3.12.0.zip
+RUN chmod +x *.sh
+
+# Copy configuration files
+COPY config.ini /opt/ibc/config.ini
+COPY jts.ini /root/Jts/jts.ini
+
+# Create startup script
+COPY start.sh /start.sh
+RUN chmod +x /start.sh
+
+# Expose the API port
+EXPOSE 4002
+
+# Start IB Gateway with IBC
+CMD ["/start.sh"]
+
+--- File: ./ibkr/start.sh ---
+#!/bin/bash
+Xvfb :1 -screen 0 1024x768x24 &
+export DISPLAY=:1
+
+# Start socat to forward the API port
+socat TCP-LISTEN:4002,fork TCP:localhost:4002 &
+
+# Start IBC which will launch and manage IB Gateway
+/opt/ibc/scripts/IBController.sh /opt/ibc/config.ini
+
+# Keep container running
+tail -f /dev/null
+
+--- File: ./ibkr/config.ini ---
+# IBC Configuration
+IbLoginId=your_username
+IbPassword=your_password
+PasswordEncrypted=no
+TradingMode=paper  # or 'live'
+IbDir=/opt/ibgateway
+StoreSettingsOnServer=no
+MinimizeMainWindow=yes
+ExistingSessionDetectedAction=primary
+AcceptIncomingConnectionAction=accept
+ShowAllTrades=no
+ForceTwsApiPort=4002
+ReadOnlyApi=no
+
+--- File: ./config/settings.py ---
+"""Configuration settings for the bot."""
+
+# Connection settings
+IB_HOST = '127.0.0.1'
+IB_PORT = 7497  # 7497 for TWS, 4002 for Gateway
+CLIENT_ID = 1
+
+# Trading parameters
+POSITION_SIZE = 100  # Base number of shares to trade
+MAX_POSITIONS = 3    # Maximum number of concurrent positions
+STOP_LOSS_PCT = 0.05 # 5% stop loss
+TAKE_PROFIT_PCT = 0.1 # 10% take profit
+
+# Strategy parameters
+LOOKBACK_PERIOD = 20
+SMA_SHORT = 5
+SMA_LONG = 20
+
+# Volatility strategy parameters
+VOLATILITY_FACTOR = 2.0  # Number of standard deviations for bands
+
+# Execution settings
+EXECUTION_INTERVAL = 3600  # Run strategy every hour (in seconds)
+
+# Risk management
+MAX_PORTFOLIO_RISK = 0.02  # Maximum 2% portfolio risk per trade
+
+# Logging settings
+LOG_LEVEL = 'INFO'
+LOG_FILE = 'logs/log'
+
+--- File: ./config/__init__.py ---
+
+
+--- File: ./config/Symbols.md ---
+# Methodology
+
+I am just going to put the entire chat log here 
+
+https://poe.com/s/t478YBrpZDQjhHFfDbOp
+
+--- File: ./config/symbols.py ---
+"""ETF symbols configuration."""
+from ib_insync import Stock
+
+# List of non-US eco ETFs to trade (filtered for scores > 5 on both profitability and world-helping)
+ETF_LIST = [
+    Stock('INRG', 'LSE', 'GBP'),     # iShares Global Clean Energy UCITS ETF
+    Stock('RENW', 'LSE', 'GBP'),     # L&G Clean Energy UCITS ETF
+    Stock('LCEU', 'XETRA', 'EUR'),   # Amundi MSCI Europe Climate Action UCITS ETF
+    Stock('VEAT', 'BIT', 'EUR'),     # VanEck Sustainable Future of Food UCITS ETF
+    Stock('FOOD', 'LSE', 'GBP'),     # Rize Sustainable Future of Food UCITS ETF
+    Stock('WATL', 'LSE', 'GBP'),     # L&G Clean Water UCITS ETF
+    Stock('CLWD', 'SIX', 'CHF'),     # iShares Global Clean Water UCITS ETF
+    Stock('RCIR', 'LSE', 'GBP'),     # BNP Paribas Easy ECPI Circular Economy Leaders UCITS ETF
+    Stock('RECY', 'XETRA', 'EUR'),   # Lyxor MSCI Circular Economy ESG Filtered UCITS ETF
+    Stock('WNTR', 'LSE', 'GBP'),     # HANetf Circularity Economy UCITS ETF
+    Stock('BIOT', 'XETRA', 'EUR'),   # BNP Paribas Easy ECPI Global ESG Biodiversity UCITS ETF
+    Stock('KLMT', 'SIX', 'CHF'),     # UBS Climate Action UCITS ETF
+    Stock('ESGL', 'LSE', 'GBP'),     # iShares MSCI Global Climate Action UCITS ETF
+    Stock('GEND', 'XETRA', 'EUR'),   # Lyxor Gender Equality ETF
+    Stock('WELL', 'LSE', 'GBP'),     # L&G Healthcare Breakthrough UCITS ETF
+    Stock('HEAL', 'XETRA', 'EUR'),   # iShares Healthcare Innovation UCITS ETF
+]
+
+# ETF exchange mapping (simplified market hours reference)
+EXCHANGE_TIMEZONES = {
+    'LSE': 'Europe/London',
+    'XETRA': 'Europe/Berlin',
+    'TSX': 'America/Toronto',
+    'NASDAQ': 'America/New_York',
+    'BIT': 'Europe/Rome',
+    'SIX': 'Europe/Zurich'
+}
+

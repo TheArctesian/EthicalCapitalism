@@ -1,0 +1,33 @@
+version: '3.8'
+
+services:
+  ibkr-gateway:
+    build: ./ibkr
+    container_name: ibkr-gateway
+    ports:
+      - "4002:4002"  # TWS API port
+      - "5900:5900"  # VNC port
+    environment:
+      - TRADING_MODE=paper  # Change to 'live' for live trading
+    volumes:
+      - ibkr-data:/root/Jts  # Persist IB settings
+    restart: unless-stopped
+
+  trading-bot:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: eco-etf-bot
+    depends_on:
+      - ibkr-gateway
+    environment:
+      - IB_HOST=ibkr-gateway
+      - IB_PORT=4002
+      - TRADING_MODE=paper  # Change to 'live' for live trading
+    volumes:
+      - ./logs:/app/logs
+      - ./stats:/app/stats
+    restart: unless-stopped
+
+volumes:
+  ibkr-data:
